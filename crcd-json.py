@@ -6,7 +6,7 @@ from collections import defaultdict, Counter
 # ======================= CONFIG =======================
 # Root directory for a single CRCD case (e.g. C_1).
 # Expected to contain COCO JSONs and extracted video frames.
-CASE_DIR = r"C:\Users\BenWright\CRCD\annotated\C_1\C_1"
+CASE_DIR = r"YOUR DIRECTORY"
 
 # COCO-format annotation files.
 # These typically correspond to frame-level annotations
