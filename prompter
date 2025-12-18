@@ -7,12 +7,13 @@ Features:
   - Interactive prompting on first frame:
       * LEFT click  → positive point
       * RIGHT click → negative point
-      * 'b'         → toggle box drawing
+      * 'b'         → toggle box drawing mode
       * 'n'         → new object
       * 'c'         → clear current object
-      * ENTER       → run SAM2
-      * ESC         → exit
-  - Supports multiple objects (each with points + box).
+      * ENTER       → validate and run SAM2
+      * ESC         → exit without running
+  - Supports multiple objects (each with points + optional box).
+  - Validates that each object has at least one positive point.
   - Runs SAM2 once on frame 0 and propagates masks through video.
 """
 
@@ -21,7 +22,7 @@ import cv2
 import torch
 import numpy as np
 from collections import defaultdict
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Generator
 
 from sam2.sam2_video_predictor import SAM2VideoPredictor
 
@@ -32,7 +33,7 @@ VIDEO_PATH = r"C:\Users\BenWright\CRCD\raw\original_dataset\original_dataset\A_1
 OUTPUT_PATH = r"C:\Users\BenWright\sam2project\A_1_left_sam2_prompted.mp4"
 
 MODEL_NAME = "facebook/sam2-hiera-small"
-DEVICE = "cpu"   # or "cuda"
+DEVICE = "cpu"  # or "cuda"
 
 USE_TRIMMED_CLIP = True
 MAX_FRAMES_FOR_SAM2 = 120
@@ -41,295 +42,699 @@ TRIM_SUFFIX = "_sam2prompt_clip.mp4"
 
 MASK_ALPHA = 0.5
 
-OBJECT_COLORS = [
-    (0, 255, 0),
-    (0, 0, 255),
-    (255, 0, 0),
-    (0, 255, 255),
-    (255, 0, 255),
-    (255, 255, 0),
-    (128, 255, 0),
-    (255, 128, 0),
-    (128, 0, 255),
+# BGR format for OpenCV
+OBJECT_COLORS_BGR = [
+    (0, 255, 0),      # Green
+    (0, 0, 255),      # Red
+    (255, 0, 0),      # Blue
+    (0, 255, 255),    # Yellow
+    (255, 0, 255),    # Magenta
+    (255, 255, 0),    # Cyan
+    (128, 255, 0),    # Light green
+    (255, 128, 0),    # Light blue
+    (128, 0, 255),    # Purple
 ]
 
 # ======================================================
 
 
-def color_for_obj(obj_id: int):
-    return OBJECT_COLORS[(obj_id - 1) % len(OBJECT_COLORS)]
+def get_object_color(obj_id: int) -> Tuple[int, int, int]:
+    """Get BGR color for an object ID (1-indexed)."""
+    return OBJECT_COLORS_BGR[(obj_id - 1) % len(OBJECT_COLORS_BGR)]
 
 
-def overlay_masks(frame_bgr: np.ndarray, mask_logits) -> np.ndarray:
-    out = frame_bgr.copy()
-    H, W, _ = out.shape
-
-    if mask_logits is None:
-        return out
-
-    if isinstance(mask_logits, dict):
-        for obj_id, m in mask_logits.items():
-            if m is None:
-                continue
-
-            if hasattr(m, "detach"):
-                m = m.detach().cpu()
-
-            m_np = m.numpy()
-            if m_np.ndim == 3 and m_np.shape[0] == 1:
-                m_np = m_np[0]
-
-            mask = m_np > 0.0
-            if not mask.any():
-                continue
-
-            color = color_for_obj(obj_id)
-            layer = np.zeros_like(out)
-            layer[mask] = color
-
-            blended = (
-                out.astype(np.float32) * (1 - MASK_ALPHA)
-                + layer.astype(np.float32) * MASK_ALPHA
-            ).astype(np.uint8)
-
-            out[mask] = blended[mask]
-
-        return out
-
-    return out
-
-
-def build_short_clip(src_path: str) -> str:
-    dst_path = src_path.replace(".mp4", TRIM_SUFFIX)
-    if os.path.exists(dst_path):
-        return dst_path
-
-    cap = cv2.VideoCapture(src_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25
-    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    out = cv2.VideoWriter(
-        dst_path,
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        max(fps / FRAME_STRIDE, 1),
-        (W, H),
-    )
-
-    read_idx, written = 0, 0
-    while written < MAX_FRAMES_FOR_SAM2:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        if read_idx % FRAME_STRIDE == 0:
-            out.write(frame)
-            written += 1
-        read_idx += 1
-
-    cap.release()
-    out.release()
-    return dst_path
+def point_in_box(x: int, y: int, box: Tuple[int, int, int, int]) -> bool:
+    """Check if point (x, y) is inside box (x0, y0, x1, y1)."""
+    x0, y0, x1, y1 = box
+    return x0 <= x <= x1 and y0 <= y <= y1
 
 
 class PromptState:
+    """Manages prompts (points and boxes) for multiple objects."""
+    
     def __init__(self):
-        self.points = defaultdict(list)
-        self.labels = defaultdict(list)
-        self.boxes = defaultdict(lambda: None)
-        self.current_obj_id = 1
+        self.points: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+        self.labels: Dict[int, List[int]] = defaultdict(list)
+        self.boxes: Dict[int, Optional[Tuple[int, int, int, int]]] = defaultdict(lambda: None)
+        self.current_obj_id: int = 1
 
-    def add_point(self, x, y, label):
+    def add_point(self, x: int, y: int, label: int) -> None:
+        """Add a point with label (1=positive, 0=negative) to current object."""
         self.points[self.current_obj_id].append((x, y))
         self.labels[self.current_obj_id].append(label)
 
-    def set_box(self, x0, y0, x1, y1):
+    def set_box(self, x0: int, y0: int, x1: int, y1: int) -> None:
+        """Set bounding box for current object, normalizing coordinates."""
         x0, x1 = sorted([x0, x1])
         y0, y1 = sorted([y0, y1])
         self.boxes[self.current_obj_id] = (x0, y0, x1, y1)
 
-    def clear_current(self):
+    def clear_current(self) -> None:
+        """Clear all prompts for current object."""
         self.points[self.current_obj_id] = []
         self.labels[self.current_obj_id] = []
         self.boxes[self.current_obj_id] = None
 
-    def next_object(self):
+    def next_object(self) -> None:
+        """Move to next object ID."""
         self.current_obj_id += 1
 
-    def iter_objects(self):
-        obj_ids = set(self.points) | set(self.boxes)
-        for obj in sorted(obj_ids):
-            pts = list(self.points[obj])
-            lbs = list(self.labels[obj])
-            box = self.boxes[obj]
+    def get_all_object_ids(self) -> List[int]:
+        """Get sorted list of all object IDs that have any prompts."""
+        obj_ids = set(self.points.keys()) | set(k for k, v in self.boxes.items() if v is not None)
+        return sorted(obj_ids)
 
-            # SAM2 REQUIREMENT:
-            # boxes are spatial priors, not foreground signals
-            if box is not None and not any(l == 1 for l in lbs):
-                x0, y0, x1, y1 = box
-                cx = int((x0 + x1) / 2)
-                cy = int((y0 + y1) / 2)
-                pts.append((cx, cy))
-                lbs.append(1)
+    def has_positive_point(self, obj_id: int) -> bool:
+        """Check if object has at least one positive point."""
+        return any(l == 1 for l in self.labels.get(obj_id, []))
 
-            pts_arr = np.array(pts, np.float32) if pts else None
-            lbs_arr = np.array(lbs, np.int32) if lbs else None
-            box_arr = np.array(box, np.float32)[None, :] if box else None
+    def get_positive_points_in_box(self, obj_id: int) -> List[Tuple[int, int]]:
+        """Get all positive points that fall within the object's box."""
+        box = self.boxes.get(obj_id)
+        if box is None:
+            return []
+        
+        result = []
+        for (x, y), label in zip(self.points.get(obj_id, []), self.labels.get(obj_id, [])):
+            if label == 1 and point_in_box(x, y, box):
+                result.append((x, y))
+        return result
 
-            if pts_arr is None and box_arr is None:
+    def iter_objects(self) -> Generator[Tuple[int, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]], None, None]:
+        """
+        Iterate over all valid objects, yielding SAM2-ready arrays.
+        
+        Yields:
+            (obj_id, points_array, labels_array, box_array)
+            - points_array: shape (N, 2) float32 or None
+            - labels_array: shape (N,) int32 or None  
+            - box_array: shape (1, 4) float32 or None
+        """
+        for obj_id in self.get_all_object_ids():
+            pts = list(self.points.get(obj_id, []))
+            lbs = list(self.labels.get(obj_id, []))
+            box = self.boxes.get(obj_id)
+
+            # Skip objects with no positive points (validation should catch this)
+            if not any(l == 1 for l in lbs):
                 continue
 
-            yield obj, pts_arr, lbs_arr, box_arr
+            pts_arr = np.array(pts, dtype=np.float32) if pts else None
+            lbs_arr = np.array(lbs, dtype=np.int32) if lbs else None
+            box_arr = np.array(box, dtype=np.float32).reshape(1, 4) if box else None
+
+            yield obj_id, pts_arr, lbs_arr, box_arr
 
 
-def draw_hud(vis, prompt_state, box_mode):
-    hud = [
-        f"Object ID: {prompt_state.current_obj_id}",
-        "",
-        "LEFT click   : Positive point",
-        "RIGHT click  : Negative point",
-        "b            : Draw box",
-        "n            : New object",
-        "c            : Clear object",
-        "ENTER        : Run SAM2",
-        "ESC          : Quit",
-    ]
-
-    overlay = vis.copy()
-    cv2.rectangle(overlay, (5, 5), (270, 190), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.4, vis, 0.6, 0, vis)
-
-    y = 25
-    for line in hud:
-        cv2.putText(vis, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        y += 18
-
-    if box_mode:
-        cv2.putText(vis, "BOX MODE ACTIVE", (10, y + 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-
-    color = color_for_obj(prompt_state.current_obj_id)
-    cv2.rectangle(vis, (230, 10), (255, 35), color, -1)
-
-
-def draw_prompt_overlay(frame, prompt_state, box_live, box_mode):
-    vis = frame.copy()
-
-    for obj, box in prompt_state.boxes.items():
-        if box is None:
-            continue
-        color = color_for_obj(obj)
-        thickness = 3 if obj == prompt_state.current_obj_id else 2
-        cv2.rectangle(vis, box[:2], box[2:], color, thickness)
-
-    if box_live:
-        cv2.rectangle(vis, box_live[:2], box_live[2:], (255, 255, 0), 1)
-
-    for obj, pts in prompt_state.points.items():
-        for (x, y), lab in zip(pts, prompt_state.labels[obj]):
-            color = (0, 255, 0) if lab == 1 else (0, 0, 255)
-            cv2.circle(vis, (x, y), 4, color, -1)
-
-    draw_hud(vis, prompt_state, box_mode)
-    return vis
+class PromptValidator:
+    """Validates prompt state before running SAM2."""
+    
+    @staticmethod
+    def validate(prompt_state: PromptState, check_points_in_box: bool = True) -> Tuple[bool, List[str]]:
+        """
+        Validate prompt state.
+        
+        Args:
+            prompt_state: The prompts to validate
+            check_points_in_box: If True, verify positive points are inside their boxes
+            
+        Returns:
+            (is_valid, list_of_error_messages)
+        """
+        errors = []
+        obj_ids = prompt_state.get_all_object_ids()
+        
+        if not obj_ids:
+            errors.append("No objects defined - add at least one point or box")
+            return False, errors
+        
+        for obj_id in obj_ids:
+            box = prompt_state.boxes.get(obj_id)
+            has_positive = prompt_state.has_positive_point(obj_id)
+            
+            if not has_positive:
+                if box is not None:
+                    errors.append(f"Object {obj_id}: has box but no positive point")
+                else:
+                    errors.append(f"Object {obj_id}: no positive point defined")
+            
+            elif check_points_in_box and box is not None:
+                points_in_box = prompt_state.get_positive_points_in_box(obj_id)
+                if not points_in_box:
+                    errors.append(f"Object {obj_id}: positive points not inside box")
+        
+        return len(errors) == 0, errors
 
 
-def interactive_prompt(video_path):
-    work_video = build_short_clip(video_path) if USE_TRIMMED_CLIP else video_path
-    cap = cv2.VideoCapture(work_video)
-    ok, frame = cap.read()
-    cap.release()
-    if not ok:
-        raise RuntimeError("Could not read first frame")
+class VideoProcessor:
+    """Handles video file operations."""
+    
+    @staticmethod
+    def build_trimmed_clip(src_path: str, max_frames: int, stride: int, suffix: str) -> str:
+        """
+        Create a trimmed/subsampled clip from source video.
+        
+        Args:
+            src_path: Source video path
+            max_frames: Maximum frames to include
+            stride: Take every Nth frame
+            suffix: Suffix for output filename
+            
+        Returns:
+            Path to trimmed clip
+        """
+        dst_path = src_path.replace(".mp4", suffix)
+        
+        if os.path.exists(dst_path):
+            print(f"Using existing trimmed clip: {dst_path}")
+            return dst_path
+        
+        print(f"Creating trimmed clip: {dst_path}")
+        
+        cap = cv2.VideoCapture(src_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open video: {src_path}")
+        
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        out_fps = max(fps / stride, 1.0)
+        out = cv2.VideoWriter(
+            dst_path,
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            out_fps,
+            (width, height),
+        )
+        
+        read_idx = 0
+        written = 0
+        
+        while written < max_frames:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if read_idx % stride == 0:
+                out.write(frame)
+                written += 1
+            read_idx += 1
+        
+        cap.release()
+        out.release()
+        
+        print(f"Created clip with {written} frames at {out_fps:.1f} fps")
+        return dst_path
 
+    @staticmethod
+    def get_first_frame(video_path: str) -> np.ndarray:
+        """Read and return the first frame of a video."""
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open video: {video_path}")
+        
+        ok, frame = cap.read()
+        cap.release()
+        
+        if not ok:
+            raise RuntimeError(f"Cannot read first frame from: {video_path}")
+        
+        return frame
+
+    @staticmethod
+    def get_video_properties(video_path: str) -> Tuple[float, int, int, int]:
+        """
+        Get video properties.
+        
+        Returns:
+            (fps, width, height, frame_count)
+        """
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open video: {video_path}")
+        
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        cap.release()
+        return fps, width, height, frame_count
+
+
+class HUD:
+    """Handles on-screen display elements."""
+    
+    @staticmethod
+    def draw_main_hud(vis: np.ndarray, prompt_state: PromptState, box_mode: bool) -> None:
+        """Draw the main HUD overlay with controls and current state."""
+        hud_lines = [
+            f"Object ID: {prompt_state.current_obj_id}",
+            f"Objects defined: {len(prompt_state.get_all_object_ids())}",
+            "",
+            "LEFT click   : Positive point",
+            "RIGHT click  : Negative point",
+            "b            : Toggle box mode",
+            "n            : New object",
+            "c            : Clear current object",
+            "ENTER        : Run SAM2",
+            "ESC          : Quit",
+        ]
+        
+        # Semi-transparent background
+        overlay = vis.copy()
+        cv2.rectangle(overlay, (5, 5), (280, 220), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.4, vis, 0.6, 0, vis)
+        
+        # Draw text lines
+        y = 25
+        for line in hud_lines:
+            cv2.putText(vis, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 
+                        0.5, (255, 255, 255), 1, cv2.LINE_AA)
+            y += 18
+        
+        # Box mode indicator
+        if box_mode:
+            cv2.putText(vis, "BOX MODE ACTIVE", (10, y + 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+        
+        # Current object color swatch
+        color = get_object_color(prompt_state.current_obj_id)
+        cv2.rectangle(vis, (240, 10), (270, 40), color, -1)
+        cv2.rectangle(vis, (240, 10), (270, 40), (255, 255, 255), 1)
+
+    @staticmethod
+    def draw_validation_errors(vis: np.ndarray, errors: List[str]) -> np.ndarray:
+        """Draw validation error overlay."""
+        result = vis.copy()
+        overlay = result.copy()
+        
+        # Calculate box size based on number of errors
+        box_height = 80 + len(errors) * 25
+        box_width = 450
+        
+        # Center the error box
+        h, w = result.shape[:2]
+        x0 = (w - box_width) // 2
+        y0 = (h - box_height) // 2
+        
+        # Red semi-transparent background
+        cv2.rectangle(overlay, (x0, y0), (x0 + box_width, y0 + box_height), (0, 0, 150), -1)
+        cv2.addWeighted(overlay, 0.9, result, 0.1, 0, result)
+        
+        # Border
+        cv2.rectangle(result, (x0, y0), (x0 + box_width, y0 + box_height), (0, 0, 255), 2)
+        
+        # Title
+        cv2.putText(result, "Cannot run SAM2 - Fix these issues:", (x0 + 15, y0 + 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+        
+        # Error messages
+        y = y0 + 60
+        for err in errors:
+            cv2.putText(result, f"* {err}", (x0 + 20, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+            y += 25
+        
+        # Instructions
+        cv2.putText(result, "Press any key to continue editing", (x0 + 15, y0 + box_height - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+        
+        return result
+
+    @staticmethod
+    def draw_progress(vis: np.ndarray, current: int, total: int, message: str = "Processing") -> np.ndarray:
+        """Draw a progress indicator."""
+        result = vis.copy()
+        h, w = result.shape[:2]
+        
+        bar_width = 300
+        bar_height = 30
+        x0 = (w - bar_width) // 2
+        y0 = h - 60
+        
+        # Background
+        cv2.rectangle(result, (x0 - 10, y0 - 30), (x0 + bar_width + 10, y0 + bar_height + 10), (0, 0, 0), -1)
+        
+        # Progress bar background
+        cv2.rectangle(result, (x0, y0), (x0 + bar_width, y0 + bar_height), (50, 50, 50), -1)
+        
+        # Progress bar fill
+        progress = current / max(total, 1)
+        fill_width = int(bar_width * progress)
+        cv2.rectangle(result, (x0, y0), (x0 + fill_width, y0 + bar_height), (0, 255, 0), -1)
+        
+        # Text
+        text = f"{message}: {current}/{total}"
+        cv2.putText(result, text, (x0, y0 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        
+        return result
+
+
+class PromptVisualizer:
+    """Handles visualization of prompts on frames."""
+    
+    @staticmethod
+    def draw_prompts(frame: np.ndarray, prompt_state: PromptState, 
+                     box_live: Optional[Tuple[int, int, int, int]] = None,
+                     box_mode: bool = False) -> np.ndarray:
+        """
+        Draw all prompts (points and boxes) on frame.
+        
+        Args:
+            frame: BGR image
+            prompt_state: Current prompts
+            box_live: Live box being drawn (x0, y0, x1, y1)
+            box_mode: Whether box mode is active
+            
+        Returns:
+            Frame with prompts visualized
+        """
+        vis = frame.copy()
+        
+        # Draw all boxes
+        for obj_id, box in prompt_state.boxes.items():
+            if box is None:
+                continue
+            color = get_object_color(obj_id)
+            thickness = 3 if obj_id == prompt_state.current_obj_id else 2
+            pt1 = (int(box[0]), int(box[1]))
+            pt2 = (int(box[2]), int(box[3]))
+            cv2.rectangle(vis, pt1, pt2, color, thickness)
+            
+            # Object ID label on box
+            cv2.putText(vis, f"Obj {obj_id}", (pt1[0], pt1[1] - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+        
+        # Draw live box being created
+        if box_live is not None:
+            pt1 = (int(box_live[0]), int(box_live[1]))
+            pt2 = (int(box_live[2]), int(box_live[3]))
+            cv2.rectangle(vis, pt1, pt2, (255, 255, 0), 1)
+        
+        # Draw all points
+        for obj_id, pts in prompt_state.points.items():
+            labels = prompt_state.labels.get(obj_id, [])
+            for (x, y), label in zip(pts, labels):
+                # Green for positive, red for negative
+                color = (0, 255, 0) if label == 1 else (0, 0, 255)
+                radius = 6 if obj_id == prompt_state.current_obj_id else 4
+                cv2.circle(vis, (int(x), int(y)), radius, color, -1)
+                cv2.circle(vis, (int(x), int(y)), radius, (255, 255, 255), 1)
+        
+        # Draw HUD
+        HUD.draw_main_hud(vis, prompt_state, box_mode)
+        
+        return vis
+
+
+class MaskOverlay:
+    """Handles mask visualization on frames."""
+    
+    @staticmethod
+    def apply_masks(frame: np.ndarray, mask_logits: Optional[Dict], alpha: float = MASK_ALPHA) -> np.ndarray:
+        """
+        Overlay segmentation masks on frame.
+        
+        Args:
+            frame: BGR image
+            mask_logits: Dict mapping obj_id -> mask tensor/array
+            alpha: Transparency of mask overlay
+            
+        Returns:
+            Frame with masks overlaid
+        """
+        result = frame.copy()
+        
+        if mask_logits is None:
+            return result
+        
+        if not isinstance(mask_logits, dict):
+            return result
+        
+        for obj_id, mask in mask_logits.items():
+            if mask is None:
+                continue
+            
+            # Convert tensor to numpy if needed
+            if hasattr(mask, "detach"):
+                mask = mask.detach().cpu().numpy()
+            
+            # Handle batch dimension
+            if mask.ndim == 3 and mask.shape[0] == 1:
+                mask = mask[0]
+            
+            # Create binary mask
+            binary_mask = mask > 0.0
+            
+            if not binary_mask.any():
+                continue
+            
+            # Create colored overlay
+            color = get_object_color(obj_id)
+            overlay = np.zeros_like(result)
+            overlay[binary_mask] = color
+            
+            # Blend
+            blended = (
+                result.astype(np.float32) * (1 - alpha) +
+                overlay.astype(np.float32) * alpha
+            ).astype(np.uint8)
+            
+            result[binary_mask] = blended[binary_mask]
+        
+        return result
+
+
+def interactive_prompt(video_path: str, use_trimmed: bool = USE_TRIMMED_CLIP) -> Tuple[Optional[PromptState], str]:
+    """
+    Run interactive prompting interface.
+    
+    Args:
+        video_path: Path to input video
+        use_trimmed: Whether to create/use a trimmed clip
+        
+    Returns:
+        (prompt_state, work_video_path) or (None, work_video_path) if cancelled
+    """
+    # Prepare video
+    if use_trimmed:
+        work_video = VideoProcessor.build_trimmed_clip(
+            video_path, MAX_FRAMES_FOR_SAM2, FRAME_STRIDE, TRIM_SUFFIX
+        )
+    else:
+        work_video = video_path
+    
+    # Get first frame for prompting
+    frame = VideoProcessor.get_first_frame(work_video)
+    
+    # Initialize state
     prompt_state = PromptState()
-    box_mode, box_start, box_live = False, None, None
-
-    def mouse_cb(event, x, y, *_):
+    box_mode = False
+    box_start: Optional[Tuple[int, int]] = None
+    box_live: Optional[Tuple[int, int, int, int]] = None
+    
+    # Mouse callback
+    def mouse_callback(event, x, y, flags, param):
         nonlocal box_start, box_live
+        
         if event == cv2.EVENT_LBUTTONDOWN:
             if box_mode:
                 box_start = (x, y)
             else:
-                prompt_state.add_point(x, y, 1)
-        elif event == cv2.EVENT_MOUSEMOVE and box_start:
-            box_live = (*box_start, x, y)
-        elif event == cv2.EVENT_LBUTTONUP and box_start:
-            prompt_state.set_box(*box_start, x, y)
-            box_start, box_live = None, None
+                prompt_state.add_point(x, y, label=1)  # Positive point
+        
+        elif event == cv2.EVENT_MOUSEMOVE:
+            if box_start is not None:
+                box_live = (box_start[0], box_start[1], x, y)
+        
+        elif event == cv2.EVENT_LBUTTONUP:
+            if box_start is not None:
+                prompt_state.set_box(box_start[0], box_start[1], x, y)
+                box_start = None
+                box_live = None
+        
         elif event == cv2.EVENT_RBUTTONDOWN:
-            prompt_state.add_point(x, y, 0)
-
-    cv2.namedWindow("SAM2 Prompting", cv2.WINDOW_NORMAL)
-    cv2.setMouseCallback("SAM2 Prompting", mouse_cb)
-
+            if not box_mode:
+                prompt_state.add_point(x, y, label=0)  # Negative point
+    
+    # Create window
+    window_name = "SAM2 Prompting"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(window_name, mouse_callback)
+    
+    print("\n" + "="*50)
+    print("SAM2 Interactive Prompting")
+    print("="*50)
+    print("LEFT click  : Add positive point (green)")
+    print("RIGHT click : Add negative point (red)")
+    print("'b'         : Toggle box drawing mode")
+    print("'n'         : Start new object")
+    print("'c'         : Clear current object")
+    print("ENTER       : Validate and run SAM2")
+    print("ESC         : Cancel and exit")
+    print("="*50 + "\n")
+    
     while True:
-        vis = draw_prompt_overlay(frame, prompt_state, box_live, box_mode)
-        cv2.imshow("SAM2 Prompting", vis)
+        # Draw current state
+        vis = PromptVisualizer.draw_prompts(frame, prompt_state, box_live, box_mode)
+        cv2.imshow(window_name, vis)
+        
         key = cv2.waitKey(30) & 0xFF
-
-        if key == 27:
+        
+        if key == 27:  # ESC - cancel
+            print("Cancelled by user")
             cv2.destroyAllWindows()
-            return prompt_state, work_video
-        elif key in (10, 13):
-            cv2.destroyAllWindows()
-            return prompt_state, work_video
-        elif key == ord("n"):
+            return None, work_video
+        
+        elif key in (10, 13):  # ENTER - validate and run
+            is_valid, errors = PromptValidator.validate(prompt_state, check_points_in_box=True)
+            
+            if is_valid:
+                print(f"Validation passed - {len(prompt_state.get_all_object_ids())} objects defined")
+                cv2.destroyAllWindows()
+                return prompt_state, work_video
+            else:
+                # Show validation errors
+                print("Validation failed:")
+                for err in errors:
+                    print(f"  - {err}")
+                
+                error_vis = HUD.draw_validation_errors(vis, errors)
+                cv2.imshow(window_name, error_vis)
+                cv2.waitKey(0)  # Wait for any key to dismiss
+        
+        elif key == ord('n'):  # New object
             prompt_state.next_object()
-        elif key == ord("c"):
+            print(f"Switched to Object {prompt_state.current_obj_id}")
+        
+        elif key == ord('c'):  # Clear current
             prompt_state.clear_current()
-        elif key == ord("b"):
+            print(f"Cleared Object {prompt_state.current_obj_id}")
+        
+        elif key == ord('b'):  # Toggle box mode
             box_mode = not box_mode
-            box_start, box_live = None, None
+            box_start = None
+            box_live = None
+            print(f"Box mode: {'ON' if box_mode else 'OFF'}")
 
 
-def run_sam2_with_prompts(video_path, output_path, prompt_state, debug=False):
+def run_sam2_segmentation(video_path: str, output_path: str, prompt_state: PromptState, 
+                          debug: bool = False) -> None:
+    """
+    Run SAM2 segmentation with the provided prompts.
+    
+    Args:
+        video_path: Path to input video
+        output_path: Path for output video
+        prompt_state: Validated prompts
+        debug: Print debug information
+    """
+    print("\n" + "="*50)
+    print("Running SAM2 Segmentation")
+    print("="*50)
+    
+    # Load model
+    print(f"Loading model: {MODEL_NAME}")
+    print(f"Device: {DEVICE}")
     predictor = SAM2VideoPredictor.from_pretrained(MODEL_NAME, device=DEVICE)
-
+    
+    # Get video properties
+    fps, width, height, frame_count = VideoProcessor.get_video_properties(video_path)
+    print(f"Video: {width}x{height} @ {fps:.1f}fps, {frame_count} frames")
+    
+    # Initialize predictor state
     with torch.inference_mode():
         state = predictor.init_state(video_path)
+        
+        # Add prompts for each object
         for obj_id, pts, lbs, box in prompt_state.iter_objects():
-            pts_t = torch.from_numpy(pts[None]).to(DEVICE) if pts is not None else None
-            lbs_t = torch.from_numpy(lbs[None]).to(DEVICE) if lbs is not None else None
-            box_t = torch.from_numpy(box).to(DEVICE) if box is not None else None
-
+            pts_tensor = torch.from_numpy(pts[None]).to(DEVICE) if pts is not None else None
+            lbs_tensor = torch.from_numpy(lbs[None]).to(DEVICE) if lbs is not None else None
+            box_tensor = torch.from_numpy(box).to(DEVICE) if box is not None else None
+            
             if debug:
-                print(f"[DEBUG] obj_id={obj_id}, points={pts_t.shape if pts_t is not None else None}, "
-                      f"labels={lbs_t.shape if lbs_t is not None else None}, box={box_t.shape if box_t is not None else None}")
-
+                print(f"Object {obj_id}:")
+                print(f"  Points shape: {pts_tensor.shape if pts_tensor is not None else None}")
+                print(f"  Labels shape: {lbs_tensor.shape if lbs_tensor is not None else None}")
+                print(f"  Box shape: {box_tensor.shape if box_tensor is not None else None}")
+            
             predictor.add_new_points_or_box(
                 state,
                 frame_idx=0,
                 obj_id=obj_id,
-                points=pts_t,
-                labels=lbs_t,
-                box=box_t,
+                points=pts_tensor,
+                labels=lbs_tensor,
+                box=box_tensor,
             )
-    assert any(
-        (pts is not None and (pts[..., 0] >= 0).any())
-        for _, pts, _, _ in prompt_state.iter_objects()
-    ), "No foreground signal provided to SAM2"
+        
+        print(f"Added prompts for {len(prompt_state.get_all_object_ids())} objects")
+    
+    # Setup video writer
+    out = cv2.VideoWriter(
+        output_path,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (width, height),
+    )
+    
+    # Open source video for reading frames
     cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25
-    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
-
+    
+    # Process video with progress display
+    print("Propagating masks through video...")
+    
     with torch.inference_mode():
-        for _, _, mask_logits in predictor.propagate_in_video(state):
+        frame_idx = 0
+        for out_frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(state):
+            # Read corresponding frame
+            # Note: propagate_in_video yields frames in order starting from 0
             ok, frame = cap.read()
             if not ok:
+                print(f"Warning: Could not read frame {frame_idx}")
                 break
-            out.write(overlay_masks(frame, mask_logits))
-
+            
+            # Apply masks
+            result_frame = MaskOverlay.apply_masks(frame, mask_logits)
+            out.write(result_frame)
+            
+            frame_idx += 1
+            
+            # Progress update every 10 frames
+            if frame_idx % 10 == 0:
+                print(f"  Processed {frame_idx} frames...")
+    
     cap.release()
     out.release()
-
+    
+    print(f"\nComplete! Processed {frame_idx} frames")
+    print(f"Output saved to: {output_path}")
 
 
 def main():
+    """Main entry point."""
+    print("\n" + "="*60)
+    print("SAM2 Video Segmentation - Interactive Prompter")
+    print("="*60)
+    print(f"Input video: {VIDEO_PATH}")
+    print(f"Output path: {OUTPUT_PATH}")
+    print("="*60)
+    
+    # Check input exists
+    if not os.path.exists(VIDEO_PATH):
+        print(f"Error: Video not found: {VIDEO_PATH}")
+        return
+    
+    # Run interactive prompting
     prompt_state, work_video = interactive_prompt(VIDEO_PATH)
-    run_sam2_with_prompts(work_video, OUTPUT_PATH, prompt_state, debug=True)  # debug=True to see shapes
+    
+    if prompt_state is None:
+        print("Exiting without processing")
+        return
+    
+    # Run SAM2 segmentation
+    run_sam2_segmentation(work_video, OUTPUT_PATH, prompt_state, debug=True)
+
 
 if __name__ == "__main__":
     main()
