@@ -1,0 +1,335 @@
+"""
+Interactive multi-layer prompting tool for SAM2 video segmentation
+with a persistent on-screen HUD.
+
+Features:
+  - Load a video (optionally trimmed/subsampled).
+  - Interactive prompting on first frame:
+      * LEFT click  → positive point
+      * RIGHT click → negative point
+      * 'b'         → toggle box drawing
+      * 'n'         → new object
+      * 'c'         → clear current object
+      * ENTER       → run SAM2
+      * ESC         → exit
+  - Supports multiple objects (each with points + box).
+  - Runs SAM2 once on frame 0 and propagates masks through video.
+"""
+
+import os
+import cv2
+import torch
+import numpy as np
+from collections import defaultdict
+from typing import Dict, List, Tuple, Optional
+
+from sam2.sam2_video_predictor import SAM2VideoPredictor
+
+
+# ======================= CONFIG =======================
+
+VIDEO_PATH = r"C:\Users\BenWright\CRCD\raw\original_dataset\original_dataset\A_1\left\left.mp4"
+OUTPUT_PATH = r"C:\Users\BenWright\sam2project\A_1_left_sam2_prompted.mp4"
+
+MODEL_NAME = "facebook/sam2-hiera-small"
+DEVICE = "cpu"   # or "cuda"
+
+USE_TRIMMED_CLIP = True
+MAX_FRAMES_FOR_SAM2 = 120
+FRAME_STRIDE = 2
+TRIM_SUFFIX = "_sam2prompt_clip.mp4"
+
+MASK_ALPHA = 0.5
+
+OBJECT_COLORS = [
+    (0, 255, 0),
+    (0, 0, 255),
+    (255, 0, 0),
+    (0, 255, 255),
+    (255, 0, 255),
+    (255, 255, 0),
+    (128, 255, 0),
+    (255, 128, 0),
+    (128, 0, 255),
+]
+
+# ======================================================
+
+
+def color_for_obj(obj_id: int):
+    return OBJECT_COLORS[(obj_id - 1) % len(OBJECT_COLORS)]
+
+
+def overlay_masks(frame_bgr: np.ndarray, mask_logits) -> np.ndarray:
+    out = frame_bgr.copy()
+    H, W, _ = out.shape
+
+    if mask_logits is None:
+        return out
+
+    if isinstance(mask_logits, dict):
+        for obj_id, m in mask_logits.items():
+            if m is None:
+                continue
+
+            if hasattr(m, "detach"):
+                m = m.detach().cpu()
+
+            m_np = m.numpy()
+            if m_np.ndim == 3 and m_np.shape[0] == 1:
+                m_np = m_np[0]
+
+            mask = m_np > 0.0
+            if not mask.any():
+                continue
+
+            color = color_for_obj(obj_id)
+            layer = np.zeros_like(out)
+            layer[mask] = color
+
+            blended = (
+                out.astype(np.float32) * (1 - MASK_ALPHA)
+                + layer.astype(np.float32) * MASK_ALPHA
+            ).astype(np.uint8)
+
+            out[mask] = blended[mask]
+
+        return out
+
+    return out
+
+
+def build_short_clip(src_path: str) -> str:
+    dst_path = src_path.replace(".mp4", TRIM_SUFFIX)
+    if os.path.exists(dst_path):
+        return dst_path
+
+    cap = cv2.VideoCapture(src_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    out = cv2.VideoWriter(
+        dst_path,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        max(fps / FRAME_STRIDE, 1),
+        (W, H),
+    )
+
+    read_idx, written = 0, 0
+    while written < MAX_FRAMES_FOR_SAM2:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if read_idx % FRAME_STRIDE == 0:
+            out.write(frame)
+            written += 1
+        read_idx += 1
+
+    cap.release()
+    out.release()
+    return dst_path
+
+
+class PromptState:
+    def __init__(self):
+        self.points = defaultdict(list)
+        self.labels = defaultdict(list)
+        self.boxes = defaultdict(lambda: None)
+        self.current_obj_id = 1
+
+    def add_point(self, x, y, label):
+        self.points[self.current_obj_id].append((x, y))
+        self.labels[self.current_obj_id].append(label)
+
+    def set_box(self, x0, y0, x1, y1):
+        x0, x1 = sorted([x0, x1])
+        y0, y1 = sorted([y0, y1])
+        self.boxes[self.current_obj_id] = (x0, y0, x1, y1)
+
+    def clear_current(self):
+        self.points[self.current_obj_id] = []
+        self.labels[self.current_obj_id] = []
+        self.boxes[self.current_obj_id] = None
+
+    def next_object(self):
+        self.current_obj_id += 1
+
+    def iter_objects(self):
+        obj_ids = set(self.points) | set(self.boxes)
+        for obj in sorted(obj_ids):
+            pts = list(self.points[obj])
+            lbs = list(self.labels[obj])
+            box = self.boxes[obj]
+
+            # SAM2 REQUIREMENT:
+            # boxes are spatial priors, not foreground signals
+            if box is not None and not any(l == 1 for l in lbs):
+                x0, y0, x1, y1 = box
+                cx = int((x0 + x1) / 2)
+                cy = int((y0 + y1) / 2)
+                pts.append((cx, cy))
+                lbs.append(1)
+
+            pts_arr = np.array(pts, np.float32) if pts else None
+            lbs_arr = np.array(lbs, np.int32) if lbs else None
+            box_arr = np.array(box, np.float32)[None, :] if box else None
+
+            if pts_arr is None and box_arr is None:
+                continue
+
+            yield obj, pts_arr, lbs_arr, box_arr
+
+
+def draw_hud(vis, prompt_state, box_mode):
+    hud = [
+        f"Object ID: {prompt_state.current_obj_id}",
+        "",
+        "LEFT click   : Positive point",
+        "RIGHT click  : Negative point",
+        "b            : Draw box",
+        "n            : New object",
+        "c            : Clear object",
+        "ENTER        : Run SAM2",
+        "ESC          : Quit",
+    ]
+
+    overlay = vis.copy()
+    cv2.rectangle(overlay, (5, 5), (270, 190), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.4, vis, 0.6, 0, vis)
+
+    y = 25
+    for line in hud:
+        cv2.putText(vis, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        y += 18
+
+    if box_mode:
+        cv2.putText(vis, "BOX MODE ACTIVE", (10, y + 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+    color = color_for_obj(prompt_state.current_obj_id)
+    cv2.rectangle(vis, (230, 10), (255, 35), color, -1)
+
+
+def draw_prompt_overlay(frame, prompt_state, box_live, box_mode):
+    vis = frame.copy()
+
+    for obj, box in prompt_state.boxes.items():
+        if box is None:
+            continue
+        color = color_for_obj(obj)
+        thickness = 3 if obj == prompt_state.current_obj_id else 2
+        cv2.rectangle(vis, box[:2], box[2:], color, thickness)
+
+    if box_live:
+        cv2.rectangle(vis, box_live[:2], box_live[2:], (255, 255, 0), 1)
+
+    for obj, pts in prompt_state.points.items():
+        for (x, y), lab in zip(pts, prompt_state.labels[obj]):
+            color = (0, 255, 0) if lab == 1 else (0, 0, 255)
+            cv2.circle(vis, (x, y), 4, color, -1)
+
+    draw_hud(vis, prompt_state, box_mode)
+    return vis
+
+
+def interactive_prompt(video_path):
+    work_video = build_short_clip(video_path) if USE_TRIMMED_CLIP else video_path
+    cap = cv2.VideoCapture(work_video)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok:
+        raise RuntimeError("Could not read first frame")
+
+    prompt_state = PromptState()
+    box_mode, box_start, box_live = False, None, None
+
+    def mouse_cb(event, x, y, *_):
+        nonlocal box_start, box_live
+        if event == cv2.EVENT_LBUTTONDOWN:
+            if box_mode:
+                box_start = (x, y)
+            else:
+                prompt_state.add_point(x, y, 1)
+        elif event == cv2.EVENT_MOUSEMOVE and box_start:
+            box_live = (*box_start, x, y)
+        elif event == cv2.EVENT_LBUTTONUP and box_start:
+            prompt_state.set_box(*box_start, x, y)
+            box_start, box_live = None, None
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            prompt_state.add_point(x, y, 0)
+
+    cv2.namedWindow("SAM2 Prompting", cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback("SAM2 Prompting", mouse_cb)
+
+    while True:
+        vis = draw_prompt_overlay(frame, prompt_state, box_live, box_mode)
+        cv2.imshow("SAM2 Prompting", vis)
+        key = cv2.waitKey(30) & 0xFF
+
+        if key == 27:
+            cv2.destroyAllWindows()
+            return prompt_state, work_video
+        elif key in (10, 13):
+            cv2.destroyAllWindows()
+            return prompt_state, work_video
+        elif key == ord("n"):
+            prompt_state.next_object()
+        elif key == ord("c"):
+            prompt_state.clear_current()
+        elif key == ord("b"):
+            box_mode = not box_mode
+            box_start, box_live = None, None
+
+
+def run_sam2_with_prompts(video_path, output_path, prompt_state, debug=False):
+    predictor = SAM2VideoPredictor.from_pretrained(MODEL_NAME, device=DEVICE)
+
+    with torch.inference_mode():
+        state = predictor.init_state(video_path)
+        for obj_id, pts, lbs, box in prompt_state.iter_objects():
+            pts_t = torch.from_numpy(pts[None]).to(DEVICE) if pts is not None else None
+            lbs_t = torch.from_numpy(lbs[None]).to(DEVICE) if lbs is not None else None
+            box_t = torch.from_numpy(box).to(DEVICE) if box is not None else None
+
+            if debug:
+                print(f"[DEBUG] obj_id={obj_id}, points={pts_t.shape if pts_t is not None else None}, "
+                      f"labels={lbs_t.shape if lbs_t is not None else None}, box={box_t.shape if box_t is not None else None}")
+
+            predictor.add_new_points_or_box(
+                state,
+                frame_idx=0,
+                obj_id=obj_id,
+                points=pts_t,
+                labels=lbs_t,
+                box=box_t,
+            )
+    assert any(
+        (pts is not None and (pts[..., 0] >= 0).any())
+        for _, pts, _, _ in prompt_state.iter_objects()
+    ), "No foreground signal provided to SAM2"
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+
+    with torch.inference_mode():
+        for _, _, mask_logits in predictor.propagate_in_video(state):
+            ok, frame = cap.read()
+            if not ok:
+                break
+            out.write(overlay_masks(frame, mask_logits))
+
+    cap.release()
+    out.release()
+
+
+
+def main():
+    prompt_state, work_video = interactive_prompt(VIDEO_PATH)
+    run_sam2_with_prompts(work_video, OUTPUT_PATH, prompt_state, debug=True)  # debug=True to see shapes
+
+if __name__ == "__main__":
+    main()
