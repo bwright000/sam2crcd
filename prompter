@@ -1,76 +1,384 @@
 """
-Interactive multi-layer prompting tool for SAM2 video segmentation
-with a persistent on-screen HUD.
+SAM2 Batch Testing Framework - Image Sequence Split Testing
 
-Features:
-  - Load a video (optionally trimmed/subsampled).
-  - Interactive prompting on first frame:
-      * LEFT click  → positive point
-      * RIGHT click → negative point
-      * 'b'         → toggle box drawing mode
-      * 'n'         → new object
-      * 'c'         → clear current object
-      * ENTER       → validate and run SAM2
-      * ESC         → exit without running
-  - Supports multiple objects (each with points + optional box).
-  - Validates that each object has at least one positive point.
-  - Runs SAM2 once on frame 0 and propagates masks through video.
+Tests 4 prompting variants across 5 randomly selected splits.
+
+Test Variants (per split):
+  1. BBOX only      - Bounding boxes without points
+  2. Clicks only    - Positive/negative points without boxes  
+  3. BBOX + Clicks  - Combined bounding boxes and points
+  4. No prompts     - No prompts (baseline)
+
+Directory Structure Expected:
+  annotated/
+  ├── C_1/
+  │   └── C_1/
+  │       └── split_imgs/
+  │           └── split_imgs/
+  │               ├── split_0/
+  │               │   ├── 00000.jpg
+  │               │   ├── 00001.jpg
+  │               │   └── ...
+  │               ├── split_1/
+  │               │   └── ...
+  │               └── split_n/
+  │                   └── ...
+  ├── C_2/
+  │   └── ...
+
+Workflow:
+  1. Scan dataset for all split folders across all sequences (C_1, C_2, etc.)
+  2. Randomly select 5 splits
+  3. For each split, use first frame (00000.jpg) for prompting
+  4. Run all 4 variants, propagating masks across all frames in the split
+  5. Total tests = 5 splits × 4 variants = 20 tests
+
+Usage:
+  python batch_tester_v4.py
 """
 
 import os
 import cv2
 import torch
+import random
 import numpy as np
+import json
+import shutil
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional, Any
+from enum import Enum
+from datetime import datetime
 from collections import defaultdict
-from typing import Dict, List, Tuple, Optional, Generator
 
 from sam2.sam2_video_predictor import SAM2VideoPredictor
 
 
-# ======================= CONFIG =======================
+# ======================= CONFIGURATION =======================
 
-VIDEO_PATH = r"C:\Users\BenWright\CRCD\raw\original_dataset\original_dataset\A_1\left\left.mp4"
-OUTPUT_PATH = r"C:\Users\BenWright\sam2project\A_1_left_sam2_prompted.mp4"
+# Path to dataset root containing sequence folders (C_1, C_2, etc.)
+DATASET_ROOT = r"C:\Users\BenWright\CRCD\annotated"
 
+# Output directory for results
+OUTPUT_DIR = r"C:\Users\BenWright\sam2project\batch_results"
+
+# Number of random splits to test
+NUM_SPLITS_TO_TEST = 5
+
+# Model settings
 MODEL_NAME = "facebook/sam2-hiera-small"
 DEVICE = "cpu"  # or "cuda"
 
-USE_TRIMMED_CLIP = True
-MAX_FRAMES_FOR_SAM2 = 120
-FRAME_STRIDE = 2
-TRIM_SUFFIX = "_sam2prompt_clip.mp4"
+# Video output settings
+OUTPUT_FPS = 10
 
+# Mask overlay
 MASK_ALPHA = 0.5
 
-# BGR format for OpenCV
-OBJECT_COLORS_BGR = [
-    (0, 255, 0),      # Green
-    (0, 0, 255),      # Red
-    (255, 0, 0),      # Blue
-    (0, 255, 255),    # Yellow
-    (255, 0, 255),    # Magenta
-    (255, 255, 0),    # Cyan
-    (128, 255, 0),    # Light green
-    (255, 128, 0),    # Light blue
-    (128, 0, 255),    # Purple
+# Random seed for reproducibility (set to None for true random)
+RANDOM_SEED = 42
+
+
+# ======================= ENUMS & DATA CLASSES =======================
+
+class PromptVariant(Enum):
+    """Test variants for prompting strategies."""
+    BBOX_ONLY = "bbox_only"
+    CLICKS_ONLY = "clicks_only"
+    BBOX_AND_CLICKS = "bbox_and_clicks"
+    NO_PROMPTS = "no_prompts"
+
+
+@dataclass
+class ObjectPrompt:
+    """Prompt definition for a single object."""
+    obj_id: int
+    label: str = ""
+    bbox: Optional[Tuple[int, int, int, int]] = None
+    positive_points: List[Tuple[int, int]] = field(default_factory=list)
+    negative_points: List[Tuple[int, int]] = field(default_factory=list)
+    
+    def has_bbox(self) -> bool:
+        return self.bbox is not None
+    
+    def has_positive_points(self) -> bool:
+        return len(self.positive_points) > 0
+
+
+@dataclass
+class SplitInfo:
+    """Information about a discovered split."""
+    sequence_name: str      # e.g., "C_1"
+    split_name: str         # e.g., "split_0"
+    split_path: str         # Full path to split folder
+    frame_files: List[str]  # Sorted list of frame filenames
+    
+    @property
+    def full_name(self) -> str:
+        return f"{self.sequence_name}_{self.split_name}"
+    
+    @property
+    def num_frames(self) -> int:
+        return len(self.frame_files)
+    
+    def get_frame_path(self, idx: int) -> str:
+        return os.path.join(self.split_path, self.frame_files[idx])
+
+
+@dataclass
+class SplitTestConfig:
+    """Configuration for testing a single split."""
+    split_info: SplitInfo
+    objects: List[ObjectPrompt] = field(default_factory=list)
+    
+    def get_prompts_for_variant(self, variant: PromptVariant) -> List[ObjectPrompt]:
+        """Get filtered prompts for a specific test variant."""
+        
+        if variant == PromptVariant.NO_PROMPTS:
+            return []
+        
+        filtered = []
+        for obj in self.objects:
+            if variant == PromptVariant.BBOX_ONLY:
+                if obj.has_bbox():
+                    filtered.append(ObjectPrompt(
+                        obj_id=obj.obj_id,
+                        label=obj.label,
+                        bbox=obj.bbox,
+                        positive_points=[],
+                        negative_points=[],
+                    ))
+                    
+            elif variant == PromptVariant.CLICKS_ONLY:
+                if obj.has_positive_points():
+                    filtered.append(ObjectPrompt(
+                        obj_id=obj.obj_id,
+                        label=obj.label,
+                        bbox=None,
+                        positive_points=obj.positive_points.copy(),
+                        negative_points=obj.negative_points.copy(),
+                    ))
+                    
+            elif variant == PromptVariant.BBOX_AND_CLICKS:
+                if obj.has_bbox() or obj.has_positive_points():
+                    filtered.append(ObjectPrompt(
+                        obj_id=obj.obj_id,
+                        label=obj.label,
+                        bbox=obj.bbox,
+                        positive_points=obj.positive_points.copy(),
+                        negative_points=obj.negative_points.copy(),
+                    ))
+        
+        return filtered
+    
+    def can_run_variant(self, variant: PromptVariant) -> Tuple[bool, str]:
+        """Check if this split has valid prompts for a variant."""
+        if variant == PromptVariant.NO_PROMPTS:
+            return True, "No prompts needed (baseline)"
+        
+        prompts = self.get_prompts_for_variant(variant)
+        if not prompts:
+            if variant == PromptVariant.BBOX_ONLY:
+                return False, "No objects have bounding boxes"
+            elif variant == PromptVariant.CLICKS_ONLY:
+                return False, "No objects have positive points"
+            else:
+                return False, "No valid prompts"
+        
+        return True, f"{len(prompts)} objects"
+
+
+# ======================= COLORS =======================
+
+OBJECT_COLORS = [
+    (0, 255, 0),     # green
+    (0, 0, 255),     # red
+    (255, 0, 0),     # blue
+    (0, 255, 255),   # yellow
+    (255, 0, 255),   # magenta
+    (255, 255, 0),   # cyan
+    (128, 255, 0),
+    (255, 128, 0),
+    (128, 0, 255),
 ]
 
-# ======================================================
+
+def color_for_obj(obj_id: int) -> Tuple[int, int, int]:
+    return OBJECT_COLORS[(obj_id - 1) % len(OBJECT_COLORS)]
 
 
-def get_object_color(obj_id: int) -> Tuple[int, int, int]:
-    """Get BGR color for an object ID (1-indexed)."""
-    return OBJECT_COLORS_BGR[(obj_id - 1) % len(OBJECT_COLORS_BGR)]
+# ======================= SPLIT DISCOVERY =======================
+
+def discover_splits(dataset_root: str) -> List[SplitInfo]:
+    """
+    Discover all splits in the dataset directory.
+    
+    Searches for pattern: {sequence}/{sequence}/split_imgs/split_imgs/split_*
+    """
+    root = Path(dataset_root)
+    splits = []
+    
+    # Find all sequence folders (C_1, C_2, etc.)
+    for seq_dir in sorted(root.iterdir()):
+        if not seq_dir.is_dir():
+            continue
+        
+        seq_name = seq_dir.name
+        
+        # Navigate to split_imgs/split_imgs
+        split_imgs_path = seq_dir / seq_name / "split_imgs" / "split_imgs"
+        
+        if not split_imgs_path.is_dir():
+            # Try alternative paths
+            alt_paths = [
+                seq_dir / seq_name / "split_imgs",
+                seq_dir / "split_imgs" / "split_imgs",
+                seq_dir / "split_imgs",
+            ]
+            for alt in alt_paths:
+                if alt.is_dir():
+                    split_imgs_path = alt
+                    break
+            else:
+                continue
+        
+        # Find all split_* folders
+        for split_dir in sorted(split_imgs_path.iterdir()):
+            if not split_dir.is_dir():
+                continue
+            if not split_dir.name.startswith("split_"):
+                continue
+            
+            # Find all frame files
+            frame_files = []
+            for ext in [".jpg", ".jpeg", ".png", ".bmp"]:
+                frame_files.extend(split_dir.glob(f"*{ext}"))
+            
+            if not frame_files:
+                continue
+            
+            # Sort by filename
+            frame_files = sorted([f.name for f in frame_files])
+            
+            splits.append(SplitInfo(
+                sequence_name=seq_name,
+                split_name=split_dir.name,
+                split_path=str(split_dir),
+                frame_files=frame_files,
+            ))
+    
+    return splits
 
 
-def point_in_box(x: int, y: int, box: Tuple[int, int, int, int]) -> bool:
-    """Check if point (x, y) is inside box (x0, y0, x1, y1)."""
-    x0, y0, x1, y1 = box
-    return x0 <= x <= x1 and y0 <= y <= y1
+def select_random_splits(splits: List[SplitInfo], n: int, seed: Optional[int] = None) -> List[SplitInfo]:
+    """Randomly select n splits from the list."""
+    if seed is not None:
+        random.seed(seed)
+    
+    if len(splits) <= n:
+        return splits
+    
+    return random.sample(splits, n)
 
+
+# ======================= IMAGE SEQUENCE HANDLING =======================
+
+def prepare_frames_for_sam2(split_info: SplitInfo, output_dir: str) -> str:
+    """
+    Prepare frame sequence for SAM2.
+    
+    SAM2VideoPredictor needs frames as JPEG files in a directory.
+    Returns path to the prepared frame directory.
+    """
+    # Create output directory for this split's frames
+    frames_dir = Path(output_dir) / "frames" / split_info.full_name
+    
+    if frames_dir.exists() and len(list(frames_dir.glob("*.jpg"))) == split_info.num_frames:
+        return str(frames_dir)
+    
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Copy/convert frames to JPEG format with sequential naming
+    for i, frame_file in enumerate(split_info.frame_files):
+        src_path = split_info.get_frame_path(i)
+        dst_path = frames_dir / f"{i:05d}.jpg"
+        
+        if dst_path.exists():
+            continue
+        
+        # Read and save as JPEG
+        img = cv2.imread(src_path)
+        if img is not None:
+            cv2.imwrite(str(dst_path), img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    
+    return str(frames_dir)
+
+
+def get_frame_dimensions(split_info: SplitInfo) -> Tuple[int, int]:
+    """Get width and height of frames in a split."""
+    first_frame_path = split_info.get_frame_path(0)
+    img = cv2.imread(first_frame_path)
+    if img is None:
+        raise RuntimeError(f"Cannot read frame: {first_frame_path}")
+    h, w = img.shape[:2]
+    return w, h
+
+
+def get_first_frame(split_info: SplitInfo) -> np.ndarray:
+    """Read first frame of a split."""
+    first_frame_path = split_info.get_frame_path(0)
+    img = cv2.imread(first_frame_path)
+    if img is None:
+        raise RuntimeError(f"Cannot read frame: {first_frame_path}")
+    return img
+
+
+# ======================= MASK OVERLAY =======================
+
+def overlay_masks(frame: np.ndarray, mask_logits, obj_ids, alpha: float = 0.5) -> np.ndarray:
+    """Overlay masks on frame with per-object colors."""
+    out = frame.copy()
+    
+    if mask_logits is None:
+        return out
+    
+    if hasattr(mask_logits, "detach"):
+        mask_logits = mask_logits.detach().cpu()
+    
+    masks = np.array(mask_logits)
+    
+    if masks.ndim == 4 and masks.shape[1] == 1:
+        masks = masks[:, 0]
+    if masks.ndim == 2:
+        masks = masks[None]
+        obj_ids = [1]
+    
+    if obj_ids is None:
+        obj_ids = list(range(1, masks.shape[0] + 1))
+    
+    for mask, obj_id in zip(masks, obj_ids):
+        binary = mask > 0.0
+        if not binary.any():
+            continue
+        
+        color = color_for_obj(int(obj_id))
+        color_layer = np.zeros_like(out, dtype=np.uint8)
+        color_layer[binary] = color
+        
+        blended = (
+            out.astype(np.float32) * (1 - alpha) +
+            color_layer.astype(np.float32) * alpha
+        ).astype(np.uint8)
+        
+        out[binary] = blended[binary]
+    
+    return out
+
+
+# ======================= INTERACTIVE PROMPTER =======================
 
 class PromptState:
-    """Manages prompts (points and boxes) for multiple objects."""
+    """Manages prompts for interactive collection."""
     
     def __init__(self):
         self.points: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
@@ -79,662 +387,580 @@ class PromptState:
         self.current_obj_id: int = 1
 
     def add_point(self, x: int, y: int, label: int) -> None:
-        """Add a point with label (1=positive, 0=negative) to current object."""
         self.points[self.current_obj_id].append((x, y))
         self.labels[self.current_obj_id].append(label)
 
     def set_box(self, x0: int, y0: int, x1: int, y1: int) -> None:
-        """Set bounding box for current object, normalizing coordinates."""
         x0, x1 = sorted([x0, x1])
         y0, y1 = sorted([y0, y1])
         self.boxes[self.current_obj_id] = (x0, y0, x1, y1)
 
     def clear_current(self) -> None:
-        """Clear all prompts for current object."""
         self.points[self.current_obj_id] = []
         self.labels[self.current_obj_id] = []
         self.boxes[self.current_obj_id] = None
 
     def next_object(self) -> None:
-        """Move to next object ID."""
         self.current_obj_id += 1
 
-    def get_all_object_ids(self) -> List[int]:
-        """Get sorted list of all object IDs that have any prompts."""
-        obj_ids = set(self.points.keys()) | set(k for k, v in self.boxes.items() if v is not None)
-        return sorted(obj_ids)
+    def get_object_ids(self) -> List[int]:
+        ids = set()
+        for obj_id, pts in self.points.items():
+            if pts:
+                ids.add(obj_id)
+        for obj_id, box in self.boxes.items():
+            if box is not None:
+                ids.add(obj_id)
+        return sorted(ids)
 
-    def has_positive_point(self, obj_id: int) -> bool:
-        """Check if object has at least one positive point."""
-        return any(l == 1 for l in self.labels.get(obj_id, []))
-
-    def get_positive_points_in_box(self, obj_id: int) -> List[Tuple[int, int]]:
-        """Get all positive points that fall within the object's box."""
+    def get_summary(self, obj_id: int) -> str:
+        pts = self.points.get(obj_id, [])
+        lbs = self.labels.get(obj_id, [])
         box = self.boxes.get(obj_id)
-        if box is None:
-            return []
         
-        result = []
-        for (x, y), label in zip(self.points.get(obj_id, []), self.labels.get(obj_id, [])):
-            if label == 1 and point_in_box(x, y, box):
-                result.append((x, y))
-        return result
+        parts = []
+        if box:
+            parts.append("bbox")
+        pos = sum(1 for l in lbs if l == 1)
+        neg = sum(1 for l in lbs if l == 0)
+        if pos:
+            parts.append(f"{pos}+")
+        if neg:
+            parts.append(f"{neg}-")
+        
+        return " ".join(parts) if parts else "empty"
 
-    def iter_objects(self) -> Generator[Tuple[int, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]], None, None]:
-        """
-        Iterate over all valid objects, yielding SAM2-ready arrays.
-        
-        Yields:
-            (obj_id, points_array, labels_array, box_array)
-            - points_array: shape (N, 2) float32 or None
-            - labels_array: shape (N,) int32 or None  
-            - box_array: shape (1, 4) float32 or None
-        """
-        for obj_id in self.get_all_object_ids():
-            pts = list(self.points.get(obj_id, []))
-            lbs = list(self.labels.get(obj_id, []))
+    def to_object_prompts(self) -> List[ObjectPrompt]:
+        """Convert to list of ObjectPrompt."""
+        objects = []
+        for obj_id in self.get_object_ids():
+            pts = self.points.get(obj_id, [])
+            lbs = self.labels.get(obj_id, [])
             box = self.boxes.get(obj_id)
+            
+            pos_pts = [(x, y) for (x, y), l in zip(pts, lbs) if l == 1]
+            neg_pts = [(x, y) for (x, y), l in zip(pts, lbs) if l == 0]
+            
+            objects.append(ObjectPrompt(
+                obj_id=obj_id,
+                label=f"object_{obj_id}",
+                bbox=box,
+                positive_points=pos_pts,
+                negative_points=neg_pts,
+            ))
+        
+        return objects
 
-            # Skip objects with no positive points (validation should catch this)
-            if not any(l == 1 for l in lbs):
-                continue
 
-            pts_arr = np.array(pts, dtype=np.float32) if pts else None
-            lbs_arr = np.array(lbs, dtype=np.int32) if lbs else None
-            box_arr = np.array(box, dtype=np.float32).reshape(1, 4) if box else None
-
-            yield obj_id, pts_arr, lbs_arr, box_arr
-
-
-class PromptValidator:
-    """Validates prompt state before running SAM2."""
+def draw_hud(vis: np.ndarray, state: PromptState, box_mode: bool, 
+             split_idx: int, total_splits: int, split_info: SplitInfo) -> None:
+    """Draw HUD overlay."""
+    h, w = vis.shape[:2]
     
-    @staticmethod
-    def validate(prompt_state: PromptState, check_points_in_box: bool = True) -> Tuple[bool, List[str]]:
-        """
-        Validate prompt state.
-        
-        Args:
-            prompt_state: The prompts to validate
-            check_points_in_box: If True, verify positive points are inside their boxes
-            
-        Returns:
-            (is_valid, list_of_error_messages)
-        """
-        errors = []
-        obj_ids = prompt_state.get_all_object_ids()
-        
-        if not obj_ids:
-            errors.append("No objects defined - add at least one point or box")
-            return False, errors
-        
-        for obj_id in obj_ids:
-            box = prompt_state.boxes.get(obj_id)
-            has_positive = prompt_state.has_positive_point(obj_id)
-            
-            if not has_positive:
-                if box is not None:
-                    errors.append(f"Object {obj_id}: has box but no positive point")
-                else:
-                    errors.append(f"Object {obj_id}: no positive point defined")
-            
-            elif check_points_in_box and box is not None:
-                points_in_box = prompt_state.get_positive_points_in_box(obj_id)
-                if not points_in_box:
-                    errors.append(f"Object {obj_id}: positive points not inside box")
-        
-        return len(errors) == 0, errors
-
-
-class VideoProcessor:
-    """Handles video file operations."""
+    mode_str = "BOX MODE" if box_mode else "POINT MODE"
+    mode_color = (0, 255, 255) if box_mode else (0, 255, 0)
     
-    @staticmethod
-    def build_trimmed_clip(src_path: str, max_frames: int, stride: int, suffix: str) -> str:
-        """
-        Create a trimmed/subsampled clip from source video.
-        
-        Args:
-            src_path: Source video path
-            max_frames: Maximum frames to include
-            stride: Take every Nth frame
-            suffix: Suffix for output filename
-            
-        Returns:
-            Path to trimmed clip
-        """
-        dst_path = src_path.replace(".mp4", suffix)
-        
-        if os.path.exists(dst_path):
-            print(f"Using existing trimmed clip: {dst_path}")
-            return dst_path
-        
-        print(f"Creating trimmed clip: {dst_path}")
-        
-        cap = cv2.VideoCapture(src_path)
-        if not cap.isOpened():
-            raise RuntimeError(f"Cannot open video: {src_path}")
-        
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
-        out_fps = max(fps / stride, 1.0)
-        out = cv2.VideoWriter(
-            dst_path,
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            out_fps,
-            (width, height),
-        )
-        
-        read_idx = 0
-        written = 0
-        
-        while written < max_frames:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            if read_idx % stride == 0:
-                out.write(frame)
-                written += 1
-            read_idx += 1
-        
-        cap.release()
-        out.release()
-        
-        print(f"Created clip with {written} frames at {out_fps:.1f} fps")
-        return dst_path
-
-    @staticmethod
-    def get_first_frame(video_path: str) -> np.ndarray:
-        """Read and return the first frame of a video."""
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise RuntimeError(f"Cannot open video: {video_path}")
-        
-        ok, frame = cap.read()
-        cap.release()
-        
-        if not ok:
-            raise RuntimeError(f"Cannot read first frame from: {video_path}")
-        
-        return frame
-
-    @staticmethod
-    def get_video_properties(video_path: str) -> Tuple[float, int, int, int]:
-        """
-        Get video properties.
-        
-        Returns:
-            (fps, width, height, frame_count)
-        """
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise RuntimeError(f"Cannot open video: {video_path}")
-        
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        cap.release()
-        return fps, width, height, frame_count
-
-
-class HUD:
-    """Handles on-screen display elements."""
+    lines = [
+        f"Split {split_idx + 1}/{total_splits}: {split_info.full_name}",
+        f"Frames: {split_info.num_frames} | Object: {state.current_obj_id}",
+        f"Mode: {mode_str}",
+        "",
+        "CONTROLS:",
+        "  [b] Toggle box/point mode",
+        "  [n] New object",
+        "  [c] Clear current object",
+        "  [ENTER] Done - run tests",
+        "  [ESC] Skip this split",
+        "",
+    ]
     
-    @staticmethod
-    def draw_main_hud(vis: np.ndarray, prompt_state: PromptState, box_mode: bool) -> None:
-        """Draw the main HUD overlay with controls and current state."""
-        hud_lines = [
-            f"Object ID: {prompt_state.current_obj_id}",
-            f"Objects defined: {len(prompt_state.get_all_object_ids())}",
-            "",
-            "LEFT click   : Positive point",
-            "RIGHT click  : Negative point",
-            "b            : Toggle box mode",
-            "n            : New object",
-            "c            : Clear current object",
-            "ENTER        : Run SAM2",
-            "ESC          : Quit",
-        ]
-        
-        # Semi-transparent background
-        overlay = vis.copy()
-        cv2.rectangle(overlay, (5, 5), (280, 220), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.4, vis, 0.6, 0, vis)
-        
-        # Draw text lines
-        y = 25
-        for line in hud_lines:
-            cv2.putText(vis, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 
-                        0.5, (255, 255, 255), 1, cv2.LINE_AA)
-            y += 18
-        
-        # Box mode indicator
-        if box_mode:
-            cv2.putText(vis, "BOX MODE ACTIVE", (10, y + 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
-        
-        # Current object color swatch
-        color = get_object_color(prompt_state.current_obj_id)
-        cv2.rectangle(vis, (240, 10), (270, 40), color, -1)
-        cv2.rectangle(vis, (240, 10), (270, 40), (255, 255, 255), 1)
-
-    @staticmethod
-    def draw_validation_errors(vis: np.ndarray, errors: List[str]) -> np.ndarray:
-        """Draw validation error overlay."""
-        result = vis.copy()
-        overlay = result.copy()
-        
-        # Calculate box size based on number of errors
-        box_height = 80 + len(errors) * 25
-        box_width = 450
-        
-        # Center the error box
-        h, w = result.shape[:2]
-        x0 = (w - box_width) // 2
-        y0 = (h - box_height) // 2
-        
-        # Red semi-transparent background
-        cv2.rectangle(overlay, (x0, y0), (x0 + box_width, y0 + box_height), (0, 0, 150), -1)
-        cv2.addWeighted(overlay, 0.9, result, 0.1, 0, result)
-        
-        # Border
-        cv2.rectangle(result, (x0, y0), (x0 + box_width, y0 + box_height), (0, 0, 255), 2)
-        
-        # Title
-        cv2.putText(result, "Cannot run SAM2 - Fix these issues:", (x0 + 15, y0 + 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-        
-        # Error messages
-        y = y0 + 60
-        for err in errors:
-            cv2.putText(result, f"* {err}", (x0 + 20, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-            y += 25
-        
-        # Instructions
-        cv2.putText(result, "Press any key to continue editing", (x0 + 15, y0 + box_height - 15),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
-        
-        return result
-
-    @staticmethod
-    def draw_progress(vis: np.ndarray, current: int, total: int, message: str = "Processing") -> np.ndarray:
-        """Draw a progress indicator."""
-        result = vis.copy()
-        h, w = result.shape[:2]
-        
-        bar_width = 300
-        bar_height = 30
-        x0 = (w - bar_width) // 2
-        y0 = h - 60
-        
-        # Background
-        cv2.rectangle(result, (x0 - 10, y0 - 30), (x0 + bar_width + 10, y0 + bar_height + 10), (0, 0, 0), -1)
-        
-        # Progress bar background
-        cv2.rectangle(result, (x0, y0), (x0 + bar_width, y0 + bar_height), (50, 50, 50), -1)
-        
-        # Progress bar fill
-        progress = current / max(total, 1)
-        fill_width = int(bar_width * progress)
-        cv2.rectangle(result, (x0, y0), (x0 + fill_width, y0 + bar_height), (0, 255, 0), -1)
-        
-        # Text
-        text = f"{message}: {current}/{total}"
-        cv2.putText(result, text, (x0, y0 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-        
-        return result
-
-
-class PromptVisualizer:
-    """Handles visualization of prompts on frames."""
-    
-    @staticmethod
-    def draw_prompts(frame: np.ndarray, prompt_state: PromptState, 
-                     box_live: Optional[Tuple[int, int, int, int]] = None,
-                     box_mode: bool = False) -> np.ndarray:
-        """
-        Draw all prompts (points and boxes) on frame.
-        
-        Args:
-            frame: BGR image
-            prompt_state: Current prompts
-            box_live: Live box being drawn (x0, y0, x1, y1)
-            box_mode: Whether box mode is active
-            
-        Returns:
-            Frame with prompts visualized
-        """
-        vis = frame.copy()
-        
-        # Draw all boxes
-        for obj_id, box in prompt_state.boxes.items():
-            if box is None:
-                continue
-            color = get_object_color(obj_id)
-            thickness = 3 if obj_id == prompt_state.current_obj_id else 2
-            pt1 = (int(box[0]), int(box[1]))
-            pt2 = (int(box[2]), int(box[3]))
-            cv2.rectangle(vis, pt1, pt2, color, thickness)
-            
-            # Object ID label on box
-            cv2.putText(vis, f"Obj {obj_id}", (pt1[0], pt1[1] - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
-        
-        # Draw live box being created
-        if box_live is not None:
-            pt1 = (int(box_live[0]), int(box_live[1]))
-            pt2 = (int(box_live[2]), int(box_live[3]))
-            cv2.rectangle(vis, pt1, pt2, (255, 255, 0), 1)
-        
-        # Draw all points
-        for obj_id, pts in prompt_state.points.items():
-            labels = prompt_state.labels.get(obj_id, [])
-            for (x, y), label in zip(pts, labels):
-                # Green for positive, red for negative
-                color = (0, 255, 0) if label == 1 else (0, 0, 255)
-                radius = 6 if obj_id == prompt_state.current_obj_id else 4
-                cv2.circle(vis, (int(x), int(y)), radius, color, -1)
-                cv2.circle(vis, (int(x), int(y)), radius, (255, 255, 255), 1)
-        
-        # Draw HUD
-        HUD.draw_main_hud(vis, prompt_state, box_mode)
-        
-        return vis
-
-
-class MaskOverlay:
-    """Handles mask visualization on frames."""
-    
-    @staticmethod
-    def apply_masks(frame: np.ndarray, mask_logits: Optional[Dict], alpha: float = MASK_ALPHA) -> np.ndarray:
-        """
-        Overlay segmentation masks on frame.
-        
-        Args:
-            frame: BGR image
-            mask_logits: Dict mapping obj_id -> mask tensor/array
-            alpha: Transparency of mask overlay
-            
-        Returns:
-            Frame with masks overlaid
-        """
-        result = frame.copy()
-        
-        if mask_logits is None:
-            return result
-        
-        if not isinstance(mask_logits, dict):
-            return result
-        
-        for obj_id, mask in mask_logits.items():
-            if mask is None:
-                continue
-            
-            # Convert tensor to numpy if needed
-            if hasattr(mask, "detach"):
-                mask = mask.detach().cpu().numpy()
-            
-            # Handle batch dimension
-            if mask.ndim == 3 and mask.shape[0] == 1:
-                mask = mask[0]
-            
-            # Create binary mask
-            binary_mask = mask > 0.0
-            
-            if not binary_mask.any():
-                continue
-            
-            # Create colored overlay
-            color = get_object_color(obj_id)
-            overlay = np.zeros_like(result)
-            overlay[binary_mask] = color
-            
-            # Blend
-            blended = (
-                result.astype(np.float32) * (1 - alpha) +
-                overlay.astype(np.float32) * alpha
-            ).astype(np.uint8)
-            
-            result[binary_mask] = blended[binary_mask]
-        
-        return result
-
-
-def interactive_prompt(video_path: str, use_trimmed: bool = USE_TRIMMED_CLIP) -> Tuple[Optional[PromptState], str]:
-    """
-    Run interactive prompting interface.
-    
-    Args:
-        video_path: Path to input video
-        use_trimmed: Whether to create/use a trimmed clip
-        
-    Returns:
-        (prompt_state, work_video_path) or (None, work_video_path) if cancelled
-    """
-    # Prepare video
-    if use_trimmed:
-        work_video = VideoProcessor.build_trimmed_clip(
-            video_path, MAX_FRAMES_FOR_SAM2, FRAME_STRIDE, TRIM_SUFFIX
-        )
+    if box_mode:
+        lines.append("Click+drag to draw box")
     else:
-        work_video = video_path
+        lines.append("LEFT: +point | RIGHT: -point")
     
-    # Get first frame for prompting
-    frame = VideoProcessor.get_first_frame(work_video)
+    lines.append("")
+    lines.append("Define BOTH bbox AND points!")
     
-    # Initialize state
-    prompt_state = PromptState()
+    # Object list
+    obj_ids = state.get_object_ids()
+    if obj_ids:
+        lines.append("")
+        lines.append("OBJECTS:")
+        for oid in obj_ids[:5]:
+            marker = ">" if oid == state.current_obj_id else " "
+            summary = state.get_summary(oid)
+            lines.append(f"  {marker} Obj {oid}: {summary}")
+    
+    # Draw background
+    line_height = 18
+    hud_height = len(lines) * line_height + 20
+    hud_width = 320
+    
+    overlay = vis.copy()
+    cv2.rectangle(overlay, (10, 10), (10 + hud_width, 10 + hud_height), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.7, vis, 0.3, 0, vis)
+    cv2.rectangle(vis, (10, 10), (10 + hud_width, 10 + hud_height), mode_color, 2)
+    
+    # Draw text
+    y = 28
+    for i, line in enumerate(lines):
+        color = (255, 255, 255)
+        if i == 0:
+            color = (255, 200, 100)
+        elif "Mode:" in line:
+            color = mode_color
+        elif "Define BOTH" in line:
+            color = (100, 200, 255)
+        cv2.putText(vis, line, (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+        y += line_height
+    
+    # Color swatch
+    color = color_for_obj(state.current_obj_id)
+    cv2.rectangle(vis, (hud_width - 25, 15), (hud_width + 5, 45), color, -1)
+
+
+def draw_prompts(vis: np.ndarray, state: PromptState, box_live: Optional[Tuple] = None) -> None:
+    """Draw prompts on frame."""
+    # Draw boxes
+    for obj_id, box in state.boxes.items():
+        if box is None:
+            continue
+        color = color_for_obj(obj_id)
+        thickness = 3 if obj_id == state.current_obj_id else 2
+        cv2.rectangle(vis, (box[0], box[1]), (box[2], box[3]), color, thickness)
+        cv2.putText(vis, f"Obj {obj_id}", (box[0], box[1] - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+    
+    # Draw live box
+    if box_live is not None:
+        x0, y0, x1, y1 = box_live
+        color = color_for_obj(state.current_obj_id)
+        cv2.rectangle(vis, (x0, y0), (x1, y1), color, 1)
+    
+    # Draw points
+    for obj_id, pts in state.points.items():
+        labels = state.labels.get(obj_id, [])
+        for (x, y), label in zip(pts, labels):
+            pt_color = (0, 255, 0) if label == 1 else (0, 0, 255)
+            radius = 6 if obj_id == state.current_obj_id else 4
+            cv2.circle(vis, (x, y), radius, pt_color, -1)
+            cv2.circle(vis, (x, y), radius, (255, 255, 255), 1)
+            symbol = "+" if label == 1 else "-"
+            cv2.putText(vis, symbol, (x + radius + 2, y + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, pt_color, 1, cv2.LINE_AA)
+
+
+def collect_prompts_for_split(
+    split_info: SplitInfo,
+    split_idx: int,
+    total_splits: int,
+) -> Optional[SplitTestConfig]:
+    """
+    Interactively collect prompts for a single split.
+    
+    Returns SplitTestConfig or None if skipped.
+    """
+    frame = get_first_frame(split_info)
+    
+    state = PromptState()
     box_mode = False
     box_start: Optional[Tuple[int, int]] = None
     box_live: Optional[Tuple[int, int, int, int]] = None
-    
-    # Mouse callback
-    def mouse_callback(event, x, y, flags, param):
+
+    def mouse_cb(event, x, y, flags, param):
         nonlocal box_start, box_live
-        
+
         if event == cv2.EVENT_LBUTTONDOWN:
             if box_mode:
                 box_start = (x, y)
+                box_live = (x, y, x, y)
             else:
-                prompt_state.add_point(x, y, label=1)  # Positive point
-        
+                state.add_point(x, y, 1)
+                
         elif event == cv2.EVENT_MOUSEMOVE:
             if box_start is not None:
                 box_live = (box_start[0], box_start[1], x, y)
-        
+                
         elif event == cv2.EVENT_LBUTTONUP:
             if box_start is not None:
-                prompt_state.set_box(box_start[0], box_start[1], x, y)
+                state.set_box(box_start[0], box_start[1], x, y)
                 box_start = None
                 box_live = None
-        
+                
         elif event == cv2.EVENT_RBUTTONDOWN:
             if not box_mode:
-                prompt_state.add_point(x, y, label=0)  # Negative point
-    
-    # Create window
-    window_name = "SAM2 Prompting"
+                state.add_point(x, y, 0)
+
+    window_name = "SAM2 Batch Prompter"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.setMouseCallback(window_name, mouse_callback)
-    
-    print("\n" + "="*50)
-    print("SAM2 Interactive Prompting")
-    print("="*50)
-    print("LEFT click  : Add positive point (green)")
-    print("RIGHT click : Add negative point (red)")
-    print("'b'         : Toggle box drawing mode")
-    print("'n'         : Start new object")
-    print("'c'         : Clear current object")
-    print("ENTER       : Validate and run SAM2")
-    print("ESC         : Cancel and exit")
-    print("="*50 + "\n")
-    
+    cv2.setMouseCallback(window_name, mouse_cb)
+
     while True:
-        # Draw current state
-        vis = PromptVisualizer.draw_prompts(frame, prompt_state, box_live, box_mode)
+        vis = frame.copy()
+        draw_prompts(vis, state, box_live)
+        draw_hud(vis, state, box_mode, split_idx, total_splits, split_info)
+        
         cv2.imshow(window_name, vis)
-        
         key = cv2.waitKey(30) & 0xFF
-        
-        if key == 27:  # ESC - cancel
-            print("Cancelled by user")
+
+        if key == 27:  # ESC - skip
             cv2.destroyAllWindows()
-            return None, work_video
-        
-        elif key in (10, 13):  # ENTER - validate and run
-            is_valid, errors = PromptValidator.validate(prompt_state, check_points_in_box=True)
+            return None
             
-            if is_valid:
-                print(f"Validation passed - {len(prompt_state.get_all_object_ids())} objects defined")
-                cv2.destroyAllWindows()
-                return prompt_state, work_video
-            else:
-                # Show validation errors
-                print("Validation failed:")
-                for err in errors:
-                    print(f"  - {err}")
-                
-                error_vis = HUD.draw_validation_errors(vis, errors)
-                cv2.imshow(window_name, error_vis)
-                cv2.waitKey(0)  # Wait for any key to dismiss
-        
-        elif key == ord('n'):  # New object
-            prompt_state.next_object()
-            print(f"Switched to Object {prompt_state.current_obj_id}")
-        
-        elif key == ord('c'):  # Clear current
-            prompt_state.clear_current()
-            print(f"Cleared Object {prompt_state.current_obj_id}")
-        
-        elif key == ord('b'):  # Toggle box mode
+        elif key in (10, 13):  # ENTER - done
+            objects = state.to_object_prompts()
+            if not objects:
+                print("    No prompts defined! Add at least one object.")
+                continue
+            
+            cv2.destroyAllWindows()
+            return SplitTestConfig(
+                split_info=split_info,
+                objects=objects,
+            )
+            
+        elif key == ord('b'):
             box_mode = not box_mode
             box_start = None
             box_live = None
-            print(f"Box mode: {'ON' if box_mode else 'OFF'}")
+            
+        elif key == ord('n'):
+            state.next_object()
+            
+        elif key == ord('c'):
+            state.clear_current()
 
 
-def run_sam2_segmentation(video_path: str, output_path: str, prompt_state: PromptState, 
-                          debug: bool = False) -> None:
-    """
-    Run SAM2 segmentation with the provided prompts.
+# ======================= SAM2 RUNNER =======================
+
+class SAM2BatchRunner:
+    """Runs SAM2 tests across splits and variants."""
     
-    Args:
-        video_path: Path to input video
-        output_path: Path for output video
-        prompt_state: Validated prompts
-        debug: Print debug information
-    """
-    print("\n" + "="*50)
-    print("Running SAM2 Segmentation")
-    print("="*50)
-    
-    # Load model
-    print(f"Loading model: {MODEL_NAME}")
-    print(f"Device: {DEVICE}")
-    predictor = SAM2VideoPredictor.from_pretrained(MODEL_NAME, device=DEVICE)
-    
-    # Get video properties
-    fps, width, height, frame_count = VideoProcessor.get_video_properties(video_path)
-    print(f"Video: {width}x{height} @ {fps:.1f}fps, {frame_count} frames")
-    
-    # Initialize predictor state
-    with torch.inference_mode():
-        state = predictor.init_state(video_path)
+    def __init__(self, output_dir: str, model_name: str = MODEL_NAME, device: str = DEVICE):
+        self.output_dir = Path(output_dir)
+        self.model_name = model_name
+        self.device = device
+        self.predictor = None
         
-        # Add prompts for each object
-        for obj_id, pts, lbs, box in prompt_state.iter_objects():
-            pts_tensor = torch.from_numpy(pts[None]).to(DEVICE) if pts is not None else None
-            lbs_tensor = torch.from_numpy(lbs[None]).to(DEVICE) if lbs is not None else None
-            box_tensor = torch.from_numpy(box).to(DEVICE) if box is not None else None
+    def load_model(self):
+        print(f"\nLoading model: {self.model_name}")
+        print(f"Device: {self.device}")
+        self.predictor = SAM2VideoPredictor.from_pretrained(self.model_name, device=self.device)
+    
+    def run_single_test(
+        self,
+        frames_dir: str,
+        split_info: SplitInfo,
+        output_path: str,
+        objects: List[ObjectPrompt],
+        variant: PromptVariant,
+    ) -> Dict[str, Any]:
+        """Run a single variant test on an image sequence."""
+        
+        result = {
+            "variant": variant.value,
+            "num_objects": len(objects),
+            "frames_processed": 0,
+            "success": False,
+            "error": None,
+        }
+        
+        try:
+            w, h = get_frame_dimensions(split_info)
             
-            if debug:
-                print(f"Object {obj_id}:")
-                print(f"  Points shape: {pts_tensor.shape if pts_tensor is not None else None}")
-                print(f"  Labels shape: {lbs_tensor.shape if lbs_tensor is not None else None}")
-                print(f"  Box shape: {box_tensor.shape if box_tensor is not None else None}")
+            with torch.inference_mode():
+                # Initialize with frame directory
+                state = self.predictor.init_state(frames_dir)
+                
+                for obj in objects:
+                    # Prepare tensors
+                    box_tensor = None
+                    if obj.bbox is not None:
+                        box_arr = np.array([[*obj.bbox]], dtype=np.float32)
+                        box_tensor = torch.tensor(box_arr).to(self.device)
+                    
+                    pts_tensor = None
+                    lbs_tensor = None
+                    all_points = []
+                    all_labels = []
+                    
+                    for pt in obj.positive_points:
+                        all_points.append(pt)
+                        all_labels.append(1)
+                    for pt in obj.negative_points:
+                        all_points.append(pt)
+                        all_labels.append(0)
+                    
+                    if all_points:
+                        pts_arr = np.array(all_points, dtype=np.float32)
+                        lbs_arr = np.array(all_labels, dtype=np.int32)
+                        pts_tensor = torch.tensor(pts_arr)[None].to(self.device)
+                        lbs_tensor = torch.tensor(lbs_arr)[None].to(self.device)
+                    
+                    # Add box first
+                    if box_tensor is not None:
+                        self.predictor.add_new_points_or_box(
+                            state, frame_idx=0, obj_id=obj.obj_id,
+                            box=box_tensor,
+                        )
+                    
+                    # Add points
+                    if pts_tensor is not None:
+                        self.predictor.add_new_points_or_box(
+                            state, frame_idx=0, obj_id=obj.obj_id,
+                            points=pts_tensor, labels=lbs_tensor,
+                        )
             
-            predictor.add_new_points_or_box(
-                state,
-                frame_idx=0,
-                obj_id=obj_id,
-                points=pts_tensor,
-                labels=lbs_tensor,
-                box=box_tensor,
+            # Write output video
+            out = cv2.VideoWriter(
+                output_path,
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                OUTPUT_FPS,
+                (w, h),
             )
+            
+            frame_count = 0
+            
+            with torch.inference_mode():
+                for frame_idx, obj_ids, mask_logits in self.predictor.propagate_in_video(state):
+                    # Read original frame
+                    frame_path = split_info.get_frame_path(frame_idx)
+                    frame = cv2.imread(frame_path)
+                    
+                    if frame is None:
+                        continue
+                    
+                    result_frame = overlay_masks(frame, mask_logits, obj_ids, MASK_ALPHA)
+                    out.write(result_frame)
+                    frame_count += 1
+            
+            out.release()
+            
+            result["frames_processed"] = frame_count
+            result["success"] = True
+            
+        except Exception as e:
+            result["error"] = str(e)
+            import traceback
+            traceback.print_exc()
         
-        print(f"Added prompts for {len(prompt_state.get_all_object_ids())} objects")
+        return result
     
-    # Setup video writer
-    out = cv2.VideoWriter(
-        output_path,
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        fps,
-        (width, height),
-    )
-    
-    # Open source video for reading frames
-    cap = cv2.VideoCapture(video_path)
-    
-    # Process video with progress display
-    print("Propagating masks through video...")
-    
-    with torch.inference_mode():
-        frame_idx = 0
-        for out_frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(state):
-            # Read corresponding frame
-            # Note: propagate_in_video yields frames in order starting from 0
-            ok, frame = cap.read()
-            if not ok:
-                print(f"Warning: Could not read frame {frame_idx}")
-                break
+    def run_split_variants(
+        self,
+        config: SplitTestConfig,
+        frames_dir: str,
+        timestamp: str,
+    ) -> Dict[str, Any]:
+        """Run all 4 variants for a single split."""
+        
+        variants = [
+            PromptVariant.BBOX_ONLY,
+            PromptVariant.CLICKS_ONLY,
+            PromptVariant.BBOX_AND_CLICKS,
+            PromptVariant.NO_PROMPTS,
+        ]
+        
+        split_info = config.split_info
+        
+        results = {
+            "split_name": split_info.full_name,
+            "sequence": split_info.sequence_name,
+            "split": split_info.split_name,
+            "num_frames": split_info.num_frames,
+            "frames_dir": frames_dir,
+            "total_objects": len(config.objects),
+            "variants": {},
+        }
+        
+        for variant in variants:
+            can_run, reason = config.can_run_variant(variant)
             
-            # Apply masks
-            result_frame = MaskOverlay.apply_masks(frame, mask_logits)
-            out.write(result_frame)
+            if not can_run:
+                print(f"      {variant.value}: SKIP - {reason}")
+                results["variants"][variant.value] = {
+                    "skipped": True,
+                    "reason": reason,
+                }
+                continue
             
-            frame_idx += 1
+            objects = config.get_prompts_for_variant(variant)
             
-            # Progress update every 10 frames
-            if frame_idx % 10 == 0:
-                print(f"  Processed {frame_idx} frames...")
-    
-    cap.release()
-    out.release()
-    
-    print(f"\nComplete! Processed {frame_idx} frames")
-    print(f"Output saved to: {output_path}")
+            # Output path
+            output_name = f"{split_info.full_name}_{variant.value}_{timestamp}.mp4"
+            output_path = str(self.output_dir / output_name)
+            
+            print(f"      {variant.value}: {len(objects)} objects... ", end="", flush=True)
+            
+            result = self.run_single_test(frames_dir, split_info, output_path, objects, variant)
+            result["output_path"] = output_path
+            
+            if result["success"]:
+                print(f"✓ {result['frames_processed']} frames")
+            else:
+                print(f"✗ {result['error']}")
+            
+            results["variants"][variant.value] = result
+        
+        return results
 
 
-def main():
-    """Main entry point."""
-    print("\n" + "="*60)
-    print("SAM2 Video Segmentation - Interactive Prompter")
-    print("="*60)
-    print(f"Input video: {VIDEO_PATH}")
-    print(f"Output path: {OUTPUT_PATH}")
-    print("="*60)
+# ======================= MAIN WORKFLOW =======================
+
+def run_batch_test():
+    """Main batch testing workflow."""
     
-    # Check input exists
-    if not os.path.exists(VIDEO_PATH):
-        print(f"Error: Video not found: {VIDEO_PATH}")
+    print("\n" + "="*70)
+    print("SAM2 BATCH TESTING FRAMEWORK - Image Sequence Splits")
+    print("="*70)
+    
+    # Setup
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = Path(OUTPUT_DIR)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Discover splits
+    print(f"\nDiscovering splits in: {DATASET_ROOT}")
+    all_splits = discover_splits(DATASET_ROOT)
+    print(f"Found {len(all_splits)} splits")
+    
+    if not all_splits:
+        print("No splits found! Check DATASET_ROOT path.")
+        print("\nExpected structure:")
+        print("  {DATASET_ROOT}/{seq}/{seq}/split_imgs/split_imgs/split_*/")
         return
     
-    # Run interactive prompting
-    prompt_state, work_video = interactive_prompt(VIDEO_PATH)
+    # Show some examples
+    print("\nExample splits found:")
+    for s in all_splits[:5]:
+        print(f"  {s.full_name}: {s.num_frames} frames")
+    if len(all_splits) > 5:
+        print(f"  ... and {len(all_splits) - 5} more")
     
-    if prompt_state is None:
-        print("Exiting without processing")
+    # Select random subset
+    selected_splits = select_random_splits(all_splits, NUM_SPLITS_TO_TEST, RANDOM_SEED)
+    print(f"\nSelected {len(selected_splits)} splits for testing:")
+    for i, s in enumerate(selected_splits):
+        print(f"  {i+1}. {s.full_name} ({s.num_frames} frames)")
+    
+    # Prepare frames
+    print("\n" + "-"*70)
+    print("STEP 1: Preparing frame directories for SAM2")
+    print("-"*70)
+    
+    prepared_splits = []
+    for split_info in selected_splits:
+        print(f"\n  {split_info.full_name}")
+        try:
+            frames_dir = prepare_frames_for_sam2(split_info, str(output_dir))
+            prepared_splits.append((split_info, frames_dir))
+            print(f"    Ready: {frames_dir}")
+        except Exception as e:
+            print(f"    ERROR: {e}")
+    
+    # Collect prompts
+    print("\n" + "-"*70)
+    print("STEP 2: Collect prompts for each split")
+    print("-"*70)
+    print("\nFor each split, define BOTH bounding boxes AND points")
+    print("This allows testing all 4 variants (bbox, clicks, combined, none)")
+    print("\nPress ENTER when done with each split, ESC to skip")
+    
+    split_configs: List[Tuple[SplitTestConfig, str]] = []
+    
+    for i, (split_info, frames_dir) in enumerate(prepared_splits):
+        print(f"\n  [{i+1}/{len(prepared_splits)}] {split_info.full_name}")
+        
+        config = collect_prompts_for_split(
+            split_info=split_info,
+            split_idx=i,
+            total_splits=len(prepared_splits),
+        )
+        
+        if config is not None:
+            split_configs.append((config, frames_dir))
+            print(f"    Collected {len(config.objects)} objects")
+            for obj in config.objects:
+                bbox_str = "bbox" if obj.has_bbox() else "no bbox"
+                pts_str = f"{len(obj.positive_points)}+ {len(obj.negative_points)}- pts"
+                print(f"      Obj {obj.obj_id}: {bbox_str}, {pts_str}")
+        else:
+            print(f"    SKIPPED")
+    
+    if not split_configs:
+        print("\nNo splits configured. Exiting.")
         return
     
-    # Run SAM2 segmentation
-    run_sam2_segmentation(work_video, OUTPUT_PATH, prompt_state, debug=True)
+    # Calculate total tests
+    total_variants = 4
+    total_tests = len(split_configs) * total_variants
+    print(f"\n\nTotal tests to run: {len(split_configs)} splits × {total_variants} variants = {total_tests}")
+    
+    # Run tests
+    print("\n" + "-"*70)
+    print("STEP 3: Running SAM2 tests")
+    print("-"*70)
+    
+    runner = SAM2BatchRunner(str(output_dir))
+    runner.load_model()
+    
+    all_results = {
+        "timestamp": timestamp,
+        "config": {
+            "model": MODEL_NAME,
+            "device": DEVICE,
+            "output_fps": OUTPUT_FPS,
+            "num_splits_tested": len(split_configs),
+            "random_seed": RANDOM_SEED,
+        },
+        "splits": {},
+    }
+    
+    test_num = 0
+    for i, (config, frames_dir) in enumerate(split_configs):
+        split_info = config.split_info
+        print(f"\n  Split {i+1}/{len(split_configs)}: {split_info.full_name}")
+        print(f"    Frames: {split_info.num_frames} | Objects: {len(config.objects)}")
+        
+        split_results = runner.run_split_variants(config, frames_dir, timestamp)
+        all_results["splits"][split_info.full_name] = split_results
+        
+        test_num += total_variants
+        print(f"    Progress: {test_num}/{total_tests} tests complete")
+    
+    # Save results
+    results_path = output_dir / f"results_{timestamp}.json"
+    with open(results_path, "w") as f:
+        json.dump(all_results, f, indent=2)
+    
+    # Summary
+    print("\n" + "="*70)
+    print("BATCH TEST SUMMARY")
+    print("="*70)
+    
+    success_count = 0
+    skip_count = 0
+    fail_count = 0
+    
+    for split_name, split_results in all_results["splits"].items():
+        print(f"\n{split_name} ({split_results.get('num_frames', '?')} frames):")
+        for variant, var_result in split_results.get("variants", {}).items():
+            if var_result.get("skipped"):
+                print(f"  {variant}: SKIPPED")
+                skip_count += 1
+            elif var_result.get("success"):
+                print(f"  {variant}: ✓ {var_result['frames_processed']} frames")
+                success_count += 1
+            else:
+                print(f"  {variant}: ✗ {var_result.get('error', 'Unknown')}")
+                fail_count += 1
+    
+    print(f"\n" + "-"*70)
+    print(f"TOTALS: {success_count} passed, {skip_count} skipped, {fail_count} failed")
+    print(f"Results saved to: {results_path}")
+    print(f"Output videos in: {output_dir}")
 
 
 if __name__ == "__main__":
-    main()
+    run_batch_test()
