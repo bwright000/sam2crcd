@@ -28,8 +28,6 @@ Combined prompting utilised both Test 2 and Test 3, as shown below:
 
 The combined result is shown below:
 
-https://github.com/user-attachments/assets/3e136657-9076-4fd1-9c7d-b86d2c2b9a57
-
 ## Discussion
 
 
