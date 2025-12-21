@@ -8,6 +8,8 @@ As previously stated, 4 separate tests were carried out - These are shown below:
 ### Test 1 - No Prompt
 The 'no prompt' provided SAM2 with a single bounding box covering the entire image - with the effective instruction of 'Find the most relevant object in this frame'.
 
+'No Prompt' results just highlighted the most 'prominant' object in the image - each time being the liver tissue. With the model struggling with the dark spots and creating clear boundaries between the tissue types, as well as responding to the movements in the tools.
+
 ### Test 2 - 3 Click Prompting
 3 Click prompting provided 3 positive clicks to each 'object' in an image - each positive click was provided on the relevant object associated. An example is shown using the prompter - Where 3 positive points under 'Object 1' are added to the frame:
 <img width="2457" height="1535" alt="image" src="https://github.com/user-attachments/assets/2f87149f-959e-41e3-8b94-e46b42078027" />
@@ -15,13 +17,13 @@ The 'no prompt' provided SAM2 with a single bounding box covering the entire ima
 This methodology yielded the following results - For all cases in this file, split-15 is used to show the results:
 ![C_1_split_15_clicks_only_20251218_213109](https://github.com/user-attachments/assets/ed394582-b86a-4ead-a75a-1b0325ca44ab)
 
-
+The above video clearly shows the right hand tool (in green) segmented well from the remainder of the video. However, the second tool on the left-hand side. Has been identfied as '2' objects by SAM2 - First highlighted in red, then again in blue. Overall however, SAM2 shows clearly segmented classes - and is able to track the objects well. Although the model clearly struggles with object boundaries as well as changes in lighting (i.e., towards the centre of the image inside the 'yellow object' part of the liver remains unsegmented throughout despite being clearly part of the same class.
 
 ### Test 3 - Bounding Box  Prompting
 Bounding Box prompting provided a single bounding box (With no positive or negative clicks) surrounding each object. With the effective instruction of 'identify the most prominant object in this frame' - An example from split-45 is shown below:
 <img width="2480" height="1546" alt="image" src="https://github.com/user-attachments/assets/7a80b0d7-793c-4913-a783-8edc61642fca" />
 
-
+Bounding box prompting shows more defined classes than the 3 click prompting, with the red and green highlighted tools being clearly separated from the remainder of the video. The bounding boxes also appear to create more flush boundaries between the object classes when compared with the positive click prompting. However, the segmentation seems to struggle with the dark spots towards the top of the video. Another issue being when the 'red' tool opens the space inbetween them (tissue) is still highlighted under the red object, as opposed to 'blue' for the liver tissue.
 
 ![C_1_split_15_bbox_only_20251218_213109](https://github.com/user-attachments/assets/de614b9b-bfb6-4d92-b825-b77dc07b8922)
 
@@ -32,9 +34,10 @@ Combined prompting utilised both Test 2 and Test 3, as shown below:
 <img width="2461" height="1517" alt="image" src="https://github.com/user-attachments/assets/58c0025a-b044-48f7-a5e6-ecb84e4ce25e" />
 
 The combined result is shown below:
+
 ![C_1_split_15_bbox_and_clicks_20251218_213109 (1)](https://github.com/user-attachments/assets/392e1423-b8c1-4ec3-a1d7-6d855c211bdd)
 
-## Discussion
+Combined prompting shows one clear advantage over the individual bounding box or positive click prompting, as while keeping the same smooth boundaries given by the bbox prompting, when the red tool opens in the later half of the video, the portion of tissue inside of the tool begins to change object class to the 'blue' liver object. However, SAM2 struggles with the dark spots towards the top left of the image again. 
 
 
 
