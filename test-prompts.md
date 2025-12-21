@@ -17,14 +17,13 @@ This methodology yielded the following results - For all cases in this file, spl
 ![C_1_split_15_bbox_and_clicks_20251218_213109 (1)](https://github.com/user-attachments/assets/392e1423-b8c1-4ec3-a1d7-6d855c211bdd)
 
 
-
-
 ### Test 3 - Bounding Box  Prompting
 Bounding Box prompting provided a single bounding box (With no positive or negative clicks) surrounding each object. With the effective instruction of 'identify the most prominant object in this frame'
 
 ### Test 4 - Combined Prompting
 Combined prompting utilised both Test 2 and Test 3
 
-## Comparison to the CRCD Dataset
+## Discussion
+
 
 
