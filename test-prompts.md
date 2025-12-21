@@ -13,7 +13,9 @@ The 'no prompt' provided SAM2 with a single bounding box covering the entire ima
 <img width="2457" height="1535" alt="image" src="https://github.com/user-attachments/assets/2f87149f-959e-41e3-8b94-e46b42078027" />
 
 This methodology yielded the following results - For all cases in this file, split-15 is used to show the results:
-https://github.com/user-attachments/assets/3e136657-9076-4fd1-9c7d-b86d2c2b9a57
+
+![C_1_split_15_bbox_and_clicks_20251218_213109 (1)](https://github.com/user-attachments/assets/392e1423-b8c1-4ec3-a1d7-6d855c211bdd)
+
 
 
 
