@@ -18,10 +18,17 @@ This methodology yielded the following results - For all cases in this file, spl
 
 
 ### Test 3 - Bounding Box  Prompting
-Bounding Box prompting provided a single bounding box (With no positive or negative clicks) surrounding each object. With the effective instruction of 'identify the most prominant object in this frame'
+Bounding Box prompting provided a single bounding box (With no positive or negative clicks) surrounding each object. With the effective instruction of 'identify the most prominant object in this frame' - An example from split-45 is shown below:
+<img width="2480" height="1546" alt="image" src="https://github.com/user-attachments/assets/7a80b0d7-793c-4913-a783-8edc61642fca" />
+
 
 ### Test 4 - Combined Prompting
-Combined prompting utilised both Test 2 and Test 3
+Combined prompting utilised both Test 2 and Test 3, as shown below:
+<img width="2461" height="1517" alt="image" src="https://github.com/user-attachments/assets/58c0025a-b044-48f7-a5e6-ecb84e4ce25e" />
+
+The combined result is shown below:
+
+https://github.com/user-attachments/assets/3e136657-9076-4fd1-9c7d-b86d2c2b9a57
 
 ## Discussion
 
