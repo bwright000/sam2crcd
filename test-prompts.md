@@ -1,5 +1,5 @@
 # Initial Prompting Test Results
-Inital prompting was done through 4 separate tests on a spread of videos - 5 data splits were chosen at random - for each datasplit 4 tests were ran on the initial frame, to create 4 sets of masks, each initial mask was then propagated over the remainder of the video using SAM2. These results were then compared with the Ground Truth masks provided in the CRCD dataset, with a DICE loss computed for each frame, and in turn an average determined for the full video
+Inital prompting was done through 4 separate tests on a spread of videos - 5 data splits were chosen at random - for each datasplit 4 tests were ran on the initial frame, to create 4 sets of masks, each initial mask was then propagated over the remainder of the video using SAM2. 
 ## Prompt Parameters
 As previously stated, 4 separate tests were carried out - These are shown below:
 
