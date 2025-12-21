@@ -13,8 +13,8 @@ The 'no prompt' provided SAM2 with a single bounding box covering the entire ima
 <img width="2457" height="1535" alt="image" src="https://github.com/user-attachments/assets/2f87149f-959e-41e3-8b94-e46b42078027" />
 
 This methodology yielded the following results - For all cases in this file, split-15 is used to show the results:
+![C_1_split_15_clicks_only_20251218_213109](https://github.com/user-attachments/assets/ed394582-b86a-4ead-a75a-1b0325ca44ab)
 
-![C_1_split_15_bbox_and_clicks_20251218_213109 (1)](https://github.com/user-attachments/assets/392e1423-b8c1-4ec3-a1d7-6d855c211bdd)
 
 
 ### Test 3 - Bounding Box  Prompting
@@ -22,11 +22,17 @@ Bounding Box prompting provided a single bounding box (With no positive or negat
 <img width="2480" height="1546" alt="image" src="https://github.com/user-attachments/assets/7a80b0d7-793c-4913-a783-8edc61642fca" />
 
 
+
+![C_1_split_15_bbox_only_20251218_213109](https://github.com/user-attachments/assets/de614b9b-bfb6-4d92-b825-b77dc07b8922)
+
+
+
 ### Test 4 - Combined Prompting
 Combined prompting utilised both Test 2 and Test 3, as shown below:
 <img width="2461" height="1517" alt="image" src="https://github.com/user-attachments/assets/58c0025a-b044-48f7-a5e6-ecb84e4ce25e" />
 
 The combined result is shown below:
+![C_1_split_15_bbox_and_clicks_20251218_213109 (1)](https://github.com/user-attachments/assets/392e1423-b8c1-4ec3-a1d7-6d855c211bdd)
 
 ## Discussion
 
